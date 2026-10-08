@@ -1,0 +1,22 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Document generation and Office temporary files
+/.proposal_work/
+~$*
+
+# Windows temporary files
+Thumbs.db
+Desktop.ini
