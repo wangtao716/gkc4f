@@ -21,7 +21,7 @@ def test_metadata_is_flushed_immediately_and_uses_utc(tmp_path):
         assert len(records) == 1
         start = records[0]
         assert start["type"] == "session_start"
-        assert start["schema_version"] == 2
+        assert start["schema_version"] == 3
         assert start["mode"] == "adaptive"
         assert start["seed"] == 7
         assert start["input_source"] == "keyboard"
@@ -51,8 +51,9 @@ def test_filters_events_and_preserves_original_fields_and_chinese(tmp_path, caps
     dash = {"type": "dash", "move_x": 0.7, "move_y": 0.7}
     player_hit = {"type": "player_hit", "damage": 16}
     boss_hit = {"type": "boss_hit", "damage": 20}
+    boss_block = {"type": "boss_block", "x": 430.0, "y": 260.0, "charge": 0.2}
     phase = {"type": "phase", "phase": "lock", "attack_id": 2}
-    accepted = [attack, decision, dash, player_hit, observation, boss_hit, phase, ended]
+    accepted = [attack, decision, dash, player_hit, observation, boss_hit, boss_block, phase, ended]
     try:
         for event in [*accepted, {"unknown": 1}, {"type": "pointer_motion"}]:
             recorder.record(event)

@@ -1,6 +1,8 @@
 """Exercise the real Pygame app lifecycle using SDL's invisible test drivers."""
 
 import os
+from dataclasses import replace
+from types import SimpleNamespace
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -275,3 +277,113 @@ def test_pause_and_focus_loss_cancel_charge_without_firing_on_resume(app, interr
     assert not controls.attack
     assert not app.world.projectiles
     assert app.world.boss.hp == app.world.boss.max_hp
+
+
+def reach_sweep_phase(app, phase):
+    start(app)
+    app.world.player.invulnerability = 1000.0
+    advance_until(app, lambda: app.world.attack_kind == "sweep" and app.world.phase == phase,
+                  limit=12.0)
+
+
+@pytest.mark.parametrize("phase", ["aim", "lock", "active"])
+def test_sweep_sidebar_does_not_reveal_frozen_direction_or_probabilities(app, phase):
+    reach_sweep_phase(app, phase)
+    snapshot = app.world.predictor.predict((0.0,) * 6)
+    frames = []
+    for direction, probabilities, applied in (
+        ("cw", (0.96, 0.03, 0.01), True),
+        ("ccw", (0.03, 0.96, 0.01), False),
+    ):
+        app.world.prediction = replace(snapshot, label=direction, probabilities=probabilities)
+        app.world.strategy_direction = direction
+        app.world.tactic_label = "顺时针横扫" if direction == "cw" else "逆时针横扫"
+        app.world.using_prediction = applied
+        app.canvas.fill((0, 0, 0))
+        app._sidebar()
+        frames.append(pygame.image.tobytes(app.canvas, "RGB"))
+    assert frames[0] == frames[1]
+
+
+@pytest.mark.parametrize("phase", ["aim", "lock", "active"])
+def test_sweep_arena_renders_only_current_beam_never_future_endpoint(app, phase):
+    reach_sweep_phase(app, phase)
+    beam = app.world.hazards[0]
+    assert beam.kind == "beam"
+    frames = []
+    for endpoint in (None, beam.angle + 3.5, beam.angle - 3.5):
+        app.world.hazards = [replace(beam, sweep_end_angle=endpoint)]
+        app._arena()
+        frames.append(pygame.image.tobytes(app.arena_surface, "RGB"))
+    assert len(set(frames)) == 1
+
+
+def test_sweep_result_reveals_prediction_with_uncommitted_side_label(app, monkeypatch):
+    reach_sweep_phase(app, "recovery")
+    values = []
+    original = app.text
+
+    def capture(value, *args, **kwargs):
+        values.append(str(value))
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(app, "text", capture)
+    app._sidebar()
+    assert "未选边" in values
+    assert any("本轮" in value and "横扫" in value for value in values)
+    assert any("未选边 ·" in value for value in values)
+    assert "靠近" not in values
+    assert "远离" not in values
+    assert values.count("33%") == 3
+    assert "本轮预测暂不公开" not in values
+
+
+def test_block_event_has_distinct_feedback_without_a_damage_number(app, monkeypatch):
+    start(app)
+    sounds = []
+    monkeypatch.setattr(app.sound, "play", sounds.append)
+    original_hp = app.world.boss.hp
+    app.world.events = [{"type": "boss_block", "x": 430.0, "y": 250.0, "charge": 0.2}]
+    app._game_events()
+    assert app.world.boss.hp == original_hp
+    assert app.boss_flash == 0.0
+    assert app.block_flash > 0.0
+    assert [number[2] for number in app.damage_numbers] == ["弹开"]
+    assert app.sparks
+    assert sounds == ["charge_cancel"]
+    app.render()
+
+
+def test_record_summary_and_result_use_both_skill_models(app, monkeypatch):
+    start(app)
+    for kind, count in (("bomb", 3), ("sweep", 4)):
+        model = app.world.predictors[kind]
+        for _ in range(count):
+            snapshot = model.predict((0.0,) * 6)
+            model.observe(snapshot, "cw")
+    summaries = []
+    app.recorder = SimpleNamespace(close=summaries.append)
+    app._close_record("completed")
+    summary = summaries[0]
+    assert summary["samples"] == 7
+    assert summary["correct"] == app.world.total_correct
+    assert summary["baseline_correct"] == app.world.total_baseline_correct
+    assert summary["models"]["bomb"]["samples"] == 3
+    assert summary["models"]["sweep"]["samples"] == 4
+    assert {"counter_attempts", "counter_hits", "adaptive_counter_attempts", "adaptive_counter_hits",
+            "sweep_attempts", "sweep_hits", "adaptive_sweep_attempts", "adaptive_sweep_hits"} <= summary.keys()
+    app.scene = "result"
+    app.world.result = "win"
+    values = []
+    original = app.text
+
+    def capture(value, *args, **kwargs):
+        values.append(str(value))
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(app, "text", capture)
+    app._overlay()
+    assert f"{app.world.total_correct}/7" in values
+    assert "总走位猜中" in values
+    assert "横扫命中" in values
+    assert "轰击追击" in values

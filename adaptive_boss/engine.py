@@ -1,8 +1,8 @@
 """Readable, deterministic boss combat with causal movement predictions.
 
-Tactics are committed before a response. The aiming marker visibly follows
-the player, then locks every hazard into its predetermined plan. Walking and
-dashing contribute actual displacement; drawing and damage share geometry.
+Tactics are committed at lock, before the measured escape. A sweep's future
+direction is hidden; only its live beam is public. Each attack learns its own
+responses. Walking and dashing contribute actual displacement.
 """
 
 from __future__ import annotations
@@ -21,26 +21,36 @@ DASH_DURATION = 0.18
 DASH_COOLDOWN = 1.10
 CHARGE_DURATION = 0.90
 SHOT_INTERVAL = 0.18
-SHOT_DAMAGE = 8
+SHOT_DAMAGE = 3
 FULL_CHARGE_DAMAGE = 42
 PROJECTILE_SPEED = 740.0
 PLAYER_HIT_DAMAGE = 16
 HIT_INVULNERABILITY = 0.75
 AIM_DURATION = 0.80
-LOCK_DURATION = 0.70
+LOCK_DURATION = 0.45
 WINDUP_DURATION = AIM_DURATION + LOCK_DURATION
 ACTIVE_DURATION = 0.28
-SWEEP_DURATION = 1.05
-FOLLOWUP_WARNING_DURATION = 0.55
-FOLLOWUP_ACTIVE_DURATION = 0.28
+SWEEP_DURATION = 1.00
+FOLLOWUP_WARNING_DURATION = 0.35
+FOLLOWUP_ACTIVE_DURATION = 0.55
 RECOVERY_DURATION = 1.40
 IDLE_DURATION = 0.55
-SWEEP_ARC = 1.20
+SWEEP_ARC = 150 * pi / 180
+SWEEP_WIDTH = 38.0
+SWEEP_RESPONSE_DISTANCE = 20.0
+BOSS_BODY_RADIUS = 44.0
+ARMOR_CHARGE_THRESHOLD = 0.50
 ARMOR_MULTIPLIER = 0.28
 EXPOSED_MULTIPLIER = 1.65
 
-_VECTORS = {"up": (0.0, -1.0), "down": (0.0, 1.0),
-            "left": (-1.0, 0.0), "right": (1.0, 0.0)}
+def _movement_vector(move_x: float, move_y: float) -> tuple[float, float]:
+    """Apply the same input bounds and diagonal limit to walking and dashing."""
+    move_x = max(-1.0, min(1.0, move_x))
+    move_y = max(-1.0, min(1.0, move_y))
+    magnitude = hypot(move_x, move_y)
+    if magnitude > 1.0:
+        return move_x / magnitude, move_y / magnitude
+    return move_x, move_y
 
 
 @dataclass(slots=True)
@@ -211,7 +221,11 @@ class World:
         self.projectiles: list[Projectile] = []
         self.hazards: list[Hazard] = []
         self.events: list[dict] = []
-        self.predictor = BehaviorPredictor(seed=self.seed, min_samples=3)
+        self.predictors = {
+            "bomb": BehaviorPredictor(seed=self.seed, min_samples=3),
+            "sweep": BehaviorPredictor(seed=self.seed, min_samples=3, labels=("cw", "ccw", "stay")),
+        }
+        self.attack_kind = "bomb"
         self.prediction: PredictionSnapshot | None = None
         self.attack_name = "准备就绪"
         self.tactic_label = "观察走位"
@@ -225,6 +239,8 @@ class World:
         self.using_prediction = False
         self.counter_attempts = self.counter_hits = 0
         self.adaptive_counter_attempts = self.adaptive_counter_hits = 0
+        self.sweep_attempts = self.sweep_hits = 0
+        self.adaptive_sweep_attempts = self.adaptive_sweep_hits = 0
         self._rng = Random(self.seed)
         self._accumulator = 0.0
         self._dash_was_down = self._pending_dash = False
@@ -238,13 +254,37 @@ class World:
         self._response_radial = self._response_tangent = self._response_distance = 0.0
         self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
         self._last_movement_direction: str | None = None
+        self._first_escape: str | None = None
+        self._first_escape_time: float | None = None
+        self._escape_tangent = 0.0
         self._attacks_started = self._attack_index = 0
         self._has_counter = self._counter_activated = False
         self._sweep_sign = 1.0
+        self._sweep_activated = self._sweep_hit = False
         self._observed_move_speed = MOVE_SPEED * CHARGE_MOVE_MULTIPLIER
         self._committed_move_speed = self._observed_move_speed
         self._locked_main: Hazard | None = None
         self._locked_counter: Hazard | None = None
+
+    @property
+    def predictor(self) -> BehaviorPredictor:
+        return self.predictors[self.attack_kind]
+
+    @property
+    def total_samples(self) -> int:
+        return sum(model.samples for model in self.predictors.values())
+
+    @property
+    def total_correct(self) -> int:
+        return sum(model.correct for model in self.predictors.values())
+
+    @property
+    def total_baseline_correct(self) -> int:
+        return sum(model.baseline_correct for model in self.predictors.values())
+
+    @property
+    def decision_hidden(self) -> bool:
+        return self.attack_kind == "sweep" and self.phase in ("aim", "lock", "active")
 
     def _event(self, event_type: str, **values: object) -> None:
         self.events.append({"type": event_type, "time": round(self.time, 6), **values})
@@ -274,8 +314,9 @@ class World:
             return
         if controls.dash and not self._dash_was_down:
             self._pending_dash = True
-            self._pending_dash_vector = ((controls.move_x, controls.move_y)
-                if hypot(controls.move_x, controls.move_y) > 1e-6 else self.player.facing)
+            movement = _movement_vector(controls.move_x, controls.move_y)
+            self._pending_dash_vector = (movement if hypot(*movement) > 1e-6
+                                         else self.player.facing)
         if controls.attack_edges:
             self._pending_attack_edges.extend(bool(pressed) for pressed in controls.attack_edges)
         elif controls.attack != self._attack_was_down:
@@ -292,12 +333,8 @@ class World:
         player.dash_cooldown = max(0.0, player.dash_cooldown - dt)
         player.attack_cooldown = max(0.0, player.attack_cooldown - dt)
         player.invulnerability = max(0.0, player.invulnerability - dt)
-        move_x = max(-1.0, min(1.0, controls.move_x))
-        move_y = max(-1.0, min(1.0, controls.move_y))
-        magnitude = hypot(move_x, move_y)
-        if magnitude > 1.0:
-            move_x, move_y = move_x / magnitude, move_y / magnitude
-        if magnitude > 1e-6 and player.dash_remaining <= 0:
+        move_x, move_y = _movement_vector(controls.move_x, controls.move_y)
+        if hypot(move_x, move_y) > 1e-6 and player.dash_remaining <= 0:
             player.facing = (move_x, move_y)
         if self._pending_dash:
             self._pending_dash = False
@@ -313,6 +350,16 @@ class World:
         player.dash_remaining = max(0.0, player.dash_remaining - dt)
         player.x = max(player.radius, min(self.width - player.radius, player.x))
         player.y = max(player.radius, min(self.height - player.radius, player.y))
+        # A solid, visibly drawn core prevents running through the beam origin
+        # or exploiting arbitrarily high angular speed at zero orbit radius.
+        dx, dy = player.x - self.boss.x, player.y - self.boss.y
+        distance = hypot(dx, dy)
+        clearance = BOSS_BODY_RADIUS + player.radius
+        if distance < clearance:
+            if distance <= 1e-8:
+                dx, dy, distance = 0.0, 1.0, 1.0
+            player.x = self.boss.x + dx / distance * clearance
+            player.y = self.boss.y + dy / distance * clearance
         self._record_displacement(previous)
         self._update_projectiles(dt)
         if self.boss.hp <= 0:
@@ -333,18 +380,25 @@ class World:
             self._advance_phase()
 
     def _start_dash(self, move_x: float, move_y: float) -> None:
+        """Commit a full-speed dash along the requested heading, at any angle."""
         if hypot(move_x, move_y) <= 1e-6:
             move_x, move_y = self.player.facing
-        direction = (("right" if move_x > 0 else "left") if abs(move_x) > abs(move_y)
-                     else ("down" if move_y > 0 else "up"))
-        self._dash_vector = self.player.facing = _VECTORS[direction]
+        magnitude = hypot(move_x, move_y)
+        if magnitude <= 1e-6:
+            move_x, move_y, magnitude = 0.0, -1.0, 1.0
+        move_x, move_y = move_x / magnitude, move_y / magnitude
+        self._dash_vector = self.player.facing = (move_x, move_y)
+        vertical = "up" if move_y < -1e-6 else "down" if move_y > 1e-6 else ""
+        horizontal = "left" if move_x < -1e-6 else "right" if move_x > 1e-6 else ""
+        direction = "_".join(part for part in (vertical, horizontal) if part)
         self.player.dash_cooldown = DASH_COOLDOWN
         self.player.dash_remaining = DASH_DURATION
         self.player.invulnerability = max(self.player.invulnerability, DASH_DURATION)
         self._charge_blocked = self.player.charging or self._attack_was_down
         self.player.charging = False
         self.player.charge = 0.0
-        self._event("dash", direction=direction, x=self.player.x, y=self.player.y)
+        self._event("dash", direction=direction, vector=list(self._dash_vector),
+                    x=self.player.x, y=self.player.y)
 
     def _update_charge(self, dt: float) -> None:
         player = self.player
@@ -363,7 +417,8 @@ class World:
                 self._charge_blocked = False
         self._pending_attack_edges.clear()
         if player.charging:
-            player.charge = min(CHARGE_DURATION, player.charge + dt)
+            charge = player.charge + dt
+            player.charge = CHARGE_DURATION if charge >= CHARGE_DURATION - 1e-10 else charge
 
     def _shoot(self, charge: float) -> None:
         if self.player.attack_cooldown > 1e-10:
@@ -393,6 +448,10 @@ class World:
             hit = _point_segment_distance_sq(self.boss.x, self.boss.y, old_x, old_y,
                 projectile.x, projectile.y) <= (self.boss.radius + projectile.radius) ** 2
             if hit:
+                if not self.boss.exposed and projectile.charge < ARMOR_CHARGE_THRESHOLD:
+                    self._event("boss_block", x=projectile.x, y=projectile.y,
+                                charge=projectile.charge, hp=self.boss.hp)
+                    continue
                 multiplier = EXPOSED_MULTIPLIER if self.boss.exposed else ARMOR_MULTIPLIER
                 damage = min(max(1, round(projectile.damage * multiplier)), self.boss.hp)
                 self.boss.hp -= damage
@@ -410,16 +469,22 @@ class World:
         if hazard.is_counter:
             self.counter_hits += 1
             self.adaptive_counter_hits += int(self.using_prediction)
+        elif self.attack_kind == "sweep" and not self._sweep_hit:
+            self._sweep_hit = True
+            self.sweep_hits += 1
+            self.adaptive_sweep_hits += int(self.using_prediction)
         self._event("player_hit", damage=PLAYER_HIT_DAMAGE, hp=player.hp, x=player.x, y=player.y,
             attack_id=hazard.attack_id, attack_number=hazard.attack_id,
             hazard_id=hazard.hazard_id, is_counter=hazard.is_counter,
-            using_prediction=self.using_prediction, strategy_direction=self.strategy_direction)
+            using_prediction=self.using_prediction, strategy_direction=self.strategy_direction,
+            attack_kind=self.attack_kind)
 
     def _set_phase(self, phase: str, duration: float) -> None:
         self.phase, self.phase_duration, self.phase_remaining = phase, duration, duration
         self.boss.exposed = phase == "recovery"
         self._sync_hazards()
-        self._event("phase", phase=phase, duration=duration, attack_id=self._attacks_started)
+        self._event("phase", phase=phase, duration=duration, attack_id=self._attacks_started,
+                    attack_kind=self.attack_kind)
 
     def _advance_phase(self) -> None:
         if self.phase == "idle":
@@ -445,46 +510,57 @@ class World:
         self._set_phase("recovery", RECOVERY_DURATION)
 
     def _begin_attack(self) -> None:
+        self._attack_index = self._attacks_started % 2
+        self.attack_kind = "bomb" if self._attack_index == 0 else "sweep"
+        self._has_counter = self.attack_kind == "bomb"
+        self._attacks_started += 1
+        self.prediction = self.strategy_direction = None
+        self.using_prediction = False
+        self._locked_main = self._locked_counter = None
+        self._counter_activated = self._sweep_activated = self._sweep_hit = False
+        self.attack_name = "定点轰击" if self.attack_kind == "bomb" else "习惯横扫"
+        self.tactic_label = "等待锁定"
+        self._set_phase("aim", AIM_DURATION)
+
+    def _commit_decision(self) -> None:
+        """Freeze past-only state at lock, before this escape can be observed."""
         player, boss = self.player, self.boss
         context = (player.x / self.width, player.y / self.height,
             (player.x - boss.x) / self.width, (player.y - boss.y) / self.height,
             hypot(player.x - boss.x, player.y - boss.y) / hypot(self.width, self.height),
             float(player.charging or self.time - self._last_attack_time <= 0.75))
         snapshot = self.predictor.predict(context)
-        fallback = self._rng.choice(DIRECTIONS)
-        self.using_prediction = self.mode == "adaptive" and snapshot.ready and snapshot.confidence >= 0.38
+        fallback = self._rng.choice(("cw", "ccw") if self.attack_kind == "sweep" else DIRECTIONS)
+        self.using_prediction = (self.mode == "adaptive" and snapshot.ready and snapshot.confidence >= 0.38
+                                 and (self.attack_kind == "bomb" or snapshot.label in ("cw", "ccw")))
         direction = snapshot.label if self.using_prediction else fallback
         self.strategy_direction, self.prediction = direction, snapshot
         self._pending_snapshot, self._pending_context = snapshot, context
         self._response_radial = self._response_tangent = self._response_distance = 0.0
         self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
         self._last_movement_direction = None
+        self._first_escape = self._first_escape_time = None
+        self._escape_tangent = 0.0
         self._decision_time = self.time
         self._committed_move_speed = self._observed_move_speed
-        self._attack_index = self._attacks_started % 2
-        self._has_counter = self._attacks_started % 3 != 0
         self._sweep_sign = -1.0 if direction == "ccw" else 1.0
-        if direction not in ("cw", "ccw"):
-            self._sweep_sign = -1.0 if (self._attacks_started // 2) % 2 else 1.0
-        self._attacks_started += 1
-        self._locked_main = self._locked_counter = None
-        self._counter_activated = False
-        self.attack_name = "定点轰击" if self._attack_index == 0 else "动态横扫"
         self.tactic_label = {"cw": "顺时针侧封", "ccw": "逆时针侧封", "in": "近身封锁",
                              "out": "外沿拦截", "stay": "原点追击"}[direction]
         if self._attack_index == 1:
-            self.tactic_label = "顺时针横扫" if self._sweep_sign > 0 else "逆时针横扫"
+            self.tactic_label = "方向已封存"
         self._event("decision", mode=self.mode, attack=self.attack_name, context=list(context),
-            prediction=snapshot.label, probabilities=dict(zip(DIRECTIONS, snapshot.probabilities)),
+            prediction=snapshot.label, probabilities=dict(zip(self.predictor.labels, snapshot.probabilities)),
             confidence=snapshot.confidence, samples=snapshot.samples, ready=snapshot.ready,
             strategy_direction=direction, using_prediction=self.using_prediction,
             attack_number=self._attacks_started, attack_id=self._attacks_started,
             has_counter=self._has_counter, tactic_label=self.tactic_label,
+            attack_kind=self.attack_kind, decision_stage="lock",
+            response_rule="first_escape" if self.attack_kind == "sweep" else "whole_window",
+            total_samples=self.total_samples,
             movement_speed_estimate=round(self._committed_move_speed, 3),
-            movement_speed_source="previous_completed_response" if self.completed_attacks else "initial_default",
-            counter_lead_time=LOCK_DURATION + FOLLOWUP_WARNING_DURATION + (
-                ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION))
-        self._set_phase("aim", AIM_DURATION)
+            movement_speed_source="previous_completed_bomb_response" if self.predictors["bomb"].samples else "initial_default",
+            counter_lead_time=(LOCK_DURATION + FOLLOWUP_WARNING_DURATION + ACTIVE_DURATION
+                               if self._has_counter else None))
 
     def _main_geometry(self, target_x: float, target_y: float) -> Hazard:
         common = {"hazard_id": f"{self._attacks_started}:main", "attack_id": self._attacks_started}
@@ -492,18 +568,22 @@ class World:
             return Hazard("circle", target_x, target_y, radius=60.0, **common)
         center = atan2(target_y - self.boss.y, target_x - self.boss.x)
         start = center
-        return Hazard("beam", self.boss.x, self.boss.y, width=34.0,
-            angle=start, length=hypot(self.width, self.height),
-            sweep_end_angle=start + self._sweep_sign * SWEEP_ARC, **common)
+        return Hazard("beam", self.boss.x, self.boss.y, width=SWEEP_WIDTH,
+            angle=start, length=hypot(self.width, self.height), **common)
 
     def _lock_attack(self) -> None:
+        self._commit_decision()
         player, boss = self.player, self.boss
         self._locked_main = self._main_geometry(player.x, player.y)
+        if self.attack_kind == "sweep":
+            self._locked_main = replace(self._locked_main,
+                sweep_end_angle=self._locked_main.angle + self._sweep_sign * SWEEP_ARC)
+            self.boss.facing = self._locked_main.angle
+            return
         dx, dy = player.x - boss.x, player.y - boss.y
         distance = hypot(dx, dy)
         rx, ry = (dx / distance, dy / distance) if distance > 1e-8 else (0.0, 1.0)
-        lead_time = LOCK_DURATION + FOLLOWUP_WARNING_DURATION + (
-            ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION)
+        lead_time = LOCK_DURATION + FOLLOWUP_WARNING_DURATION + ACTIVE_DURATION
         travel = self._committed_move_speed * lead_time
         if self.strategy_direction in ("cw", "ccw"):
             sign = 1.0 if self.strategy_direction == "cw" else -1.0
@@ -518,12 +598,7 @@ class World:
         common = {"is_counter": True, "hazard_id": f"{self._attacks_started}:counter",
                   "attack_id": self._attacks_started}
         if self._has_counter:
-            if self._attack_index == 0:
-                self._locked_counter = Hazard("circle", target_x, target_y, radius=44.0, **common)
-            else:
-                self._locked_counter = Hazard("beam", boss.x, boss.y, width=30.0,
-                    angle=atan2(target_y - boss.y, target_x - boss.x),
-                    length=hypot(self.width, self.height), **common)
+            self._locked_counter = Hazard("circle", target_x, target_y, radius=44.0, **common)
         self.boss.facing = atan2(player.y - boss.y, player.x - boss.x)
 
     def _sync_hazards(self) -> None:
@@ -533,14 +608,21 @@ class World:
             self.hazards = [replace(self._main_geometry(self.player.x, self.player.y), progress=progress)]
             self.boss.facing = atan2(self.player.y - self.boss.y, self.player.x - self.boss.x)
         elif self.phase == "lock" and self._locked_main is not None:
-            self.hazards = [replace(self._locked_main, progress=progress)]
+            self.hazards = [replace(self._locked_main, progress=progress, sweep_end_angle=None)]
         elif self.phase == "active" and self._locked_main is not None:
             hazard = self._locked_main
             if hazard.sweep_end_angle is not None:
-                angle = hazard.angle + (hazard.sweep_end_angle - hazard.angle) * progress
+                # Begin visibly, then accelerate into the predicted escape.
+                # This leaves time to rescue a wrong choice with a dash while
+                # preventing constant-speed walking from outrunning the sweep.
+                angle = hazard.angle + (hazard.sweep_end_angle - hazard.angle) * progress ** 2
                 hazard = replace(hazard, angle=angle)
                 self.boss.facing = angle
             self.hazards = [replace(hazard, active=True, progress=progress)]
+            if self.attack_kind == "sweep" and not self._sweep_activated:
+                self._sweep_activated = True
+                self.sweep_attempts += 1
+                self.adaptive_sweep_attempts += int(self.using_prediction)
         elif self.phase == "followup" and self._locked_counter is not None:
             active = elapsed + 1e-10 >= FOLLOWUP_WARNING_DURATION
             stage_progress = ((elapsed - FOLLOWUP_WARNING_DURATION) / FOLLOWUP_ACTIVE_DURATION
@@ -571,6 +653,14 @@ class World:
             rx, ry, radial_distance = 0.0, 1.0, 1.0
         rx, ry = rx / radial_distance, ry / radial_distance
         radial, tangent = dx * rx + dy * ry, -dx * ry + dy * rx
+        # Capture the first real lateral escape, never the later rescue dash.
+        # Stop at beam ignition: moves in reaction to a visible sweep do not
+        # count as a pre-reveal habit, even if there was no earlier choice.
+        if self.attack_kind == "sweep" and self.phase == "lock" and self._first_escape is None:
+            self._escape_tangent += tangent
+            if abs(self._escape_tangent) >= SWEEP_RESPONSE_DISTANCE:
+                self._first_escape = "cw" if self._escape_tangent > 0 else "ccw"
+                self._first_escape_time = self.time
         self._response_radial += radial
         self._response_tangent += tangent
         self._response_distance += distance
@@ -585,7 +675,9 @@ class World:
         if snapshot is None:
             return
         radial, tangent = self._response_radial, self._response_tangent
-        if self._response_distance < 18.0:
+        if self.attack_kind == "sweep":
+            actual = self._first_escape or "stay"
+        elif self._response_distance < 18.0:
             actual = "stay"
         else:
             largest = max(self._response_travel.values())
@@ -596,8 +688,12 @@ class World:
         self.last_prediction_hit = snapshot.label == actual
         self.predictor.observe(snapshot, actual)
         self._event("observation", mode=self.mode, context=list(self._pending_context or ()),
+            attack_kind=self.attack_kind,
+            response_rule="first_escape" if self.attack_kind == "sweep" else "whole_window",
+            first_escape_time=round(self._first_escape_time, 6) if self._first_escape_time is not None else None,
+            total_samples=self.total_samples,
             features=list(snapshot.features), prediction=snapshot.label,
-            probabilities=dict(zip(DIRECTIONS, snapshot.probabilities)),
+            probabilities=dict(zip(self.predictor.labels, snapshot.probabilities)),
             confidence=snapshot.confidence, actual=actual, correct=self.last_prediction_hit,
             baseline_prediction=snapshot.baseline_label, baseline_correct=snapshot.baseline_label == actual,
             samples_before=snapshot.samples, samples_after=self.predictor.samples,
@@ -609,8 +705,9 @@ class World:
             distance_moved=round(self._response_distance, 3),
             directional_travel={label: round(distance, 3) for label, distance in self._response_travel.items()})
         response_time = self.time - self._decision_time if self._decision_time is not None else FIXED_STEP
-        self._observed_move_speed = max(60.0, min(MOVE_SPEED,
-            self._response_distance / max(FIXED_STEP, response_time)))
+        if self.attack_kind == "bomb":
+            self._observed_move_speed = max(60.0, min(MOVE_SPEED,
+                self._response_distance / max(FIXED_STEP, response_time)))
         self._pending_snapshot = self._pending_context = self._decision_time = None
 
     def _finish(self, result: str) -> None:
@@ -623,6 +720,9 @@ class World:
         self.hazards = []
         self._event("end", result=result, mode=self.mode, player_hp=self.player.hp,
             boss_hp=self.boss.hp, completed_attacks=self.completed_attacks,
-            samples=self.predictor.samples, counter_attempts=self.counter_attempts,
+            samples=self.total_samples, samples_by_attack={kind: model.samples for kind, model in self.predictors.items()},
+            counter_attempts=self.counter_attempts,
             counter_hits=self.counter_hits, adaptive_counter_attempts=self.adaptive_counter_attempts,
-            adaptive_counter_hits=self.adaptive_counter_hits)
+            adaptive_counter_hits=self.adaptive_counter_hits, sweep_attempts=self.sweep_attempts,
+            sweep_hits=self.sweep_hits, adaptive_sweep_attempts=self.adaptive_sweep_attempts,
+            adaptive_sweep_hits=self.adaptive_sweep_hits)

@@ -193,6 +193,26 @@ class BehaviorPredictorTests(unittest.TestCase):
                 model.observe(model.predict(CONTEXT), label)
         self.assertEqual(model.samples, 0)
 
+    def test_sweep_model_has_a_normalized_three_class_distribution(self):
+        model = BehaviorPredictor(labels=("cw", "ccw", "stay"))
+        cold = model.predict(CONTEXT)
+        self.assertEqual(cold.probabilities, (1 / 3,) * 3)
+        self.assertEqual(len(cold.features), 15)
+        self.feed(model, "cw", 5)
+        learned = model.predict(CONTEXT)
+        self.assertEqual(learned.label, "cw")
+        self.assertAlmostEqual(sum(learned.probabilities), 1.0)
+        self.assertGreater(learned.confidence, 0.6)
+        with self.assertRaises(ValueError):
+            model.observe(learned, "in")
+        with self.assertRaises(ValueError):
+            model.observe(BehaviorPredictor().predict(CONTEXT), "cw")
+
+    def test_invalid_class_sets_are_rejected(self):
+        for labels in ((), ("cw",), ("cw", "cw"), ("cw", "left")):
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                BehaviorPredictor(labels=labels)
+
 
 if __name__ == "__main__":
     unittest.main()

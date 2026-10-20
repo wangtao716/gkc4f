@@ -1,6 +1,6 @@
 """Small CPU-only online model for predicting a player's next response.
 
-Call ``predict`` when a boss telegraph begins, then pass that *same* immutable
+Call ``predict`` when an attack locks, then pass that *same* immutable
 snapshot to ``observe`` when the response window closes.  A response must be a
 real recorded movement (or ``stay``), never the model's own prediction.
 This keeps evaluation and training causal: the answer is not a feature.
@@ -20,7 +20,6 @@ from sklearn.linear_model import SGDClassifier
 DIRECTIONS = ("cw", "ccw", "in", "out", "stay")
 CONTEXT_SIZE = 6
 _HISTORY_SIZE = 3
-_FEATURE_SIZE = CONTEXT_SIZE + _HISTORY_SIZE * len(DIRECTIONS)
 _RECENCY_DECAY = 0.72
 _PRIOR_SMOOTHING = 0.15
 _RECENT_WEIGHT = 0.75
@@ -47,10 +46,10 @@ class BehaviorPredictor:
     recently or is charging.  The remaining features are three one-hot encoded
     *previous* responses, newest first; absent history slots are all zeros.
 
-    Responses are clockwise/counterclockwise around the boss, toward/away
-    from the boss, or stationary.  The engine measures actual displacement
-    across a response window, including ordinary movement and successful
-    dashes.  This learner never infers a label from input buttons.
+    The engine owns independent instances for bombs and sweeps. Bombs learn
+    clockwise/counterclockwise, toward/away, or stationary full responses.
+    Sweeps learn the first pre-ignition lateral escape (cw/ccw), with stay
+    meaning no clear choice. Both use real movement, never input buttons.
 
     Each observation decays older response counts by 0.72 and adds one SGD
     update with a constant learning rate.  Smoothed recent frequencies carry
@@ -65,9 +64,15 @@ class BehaviorPredictor:
     These are predictions made *before* their corresponding training update.
     """
 
-    def __init__(self, seed: int = 7, min_samples: int = 3) -> None:
+    def __init__(self, seed: int = 7, min_samples: int = 3,
+                 labels: Sequence[str] = DIRECTIONS) -> None:
         if not isinstance(min_samples, int) or min_samples < 1:
             raise ValueError("min_samples must be a positive integer")
+        self.labels = tuple(labels)
+        if (len(self.labels) < 2 or len(set(self.labels)) != len(self.labels)
+                or any(label not in DIRECTIONS for label in self.labels)):
+            raise ValueError("labels must be distinct supported directions, with at least two classes")
+        self.feature_size = CONTEXT_SIZE + _HISTORY_SIZE * len(self.labels)
         self.seed = seed
         self.min_samples = min_samples
         self.reset()
@@ -90,8 +95,8 @@ class BehaviorPredictor:
         self.direction_correct = 0
         self.baseline_correct = 0
         self.history: list[str] = []
-        self.counts: dict[str, int] = dict.fromkeys(DIRECTIONS, 0)
-        self._recent_counts: dict[str, float] = dict.fromkeys(DIRECTIONS, 0.0)
+        self.counts: dict[str, int] = dict.fromkeys(self.labels, 0)
+        self._recent_counts: dict[str, float] = dict.fromkeys(self.labels, 0.0)
         self._recent_outcomes: deque[bool] = deque(maxlen=20)
 
     @property
@@ -110,30 +115,30 @@ class BehaviorPredictor:
         history_features = tuple(
             float(index < len(previous) and previous[index] == direction)
             for index in range(_HISTORY_SIZE)
-            for direction in DIRECTIONS
+            for direction in self.labels
         )
         return values + history_features
 
     def _prior(self) -> tuple[float, ...]:
         if not self.samples:
-            return (1.0 / len(DIRECTIONS),) * len(DIRECTIONS)
-        denominator = sum(self._recent_counts.values()) + _PRIOR_SMOOTHING * len(DIRECTIONS)
+            return (1.0 / len(self.labels),) * len(self.labels)
+        denominator = sum(self._recent_counts.values()) + _PRIOR_SMOOTHING * len(self.labels)
         return tuple(
             (self._recent_counts[direction] + _PRIOR_SMOOTHING) / denominator
-            for direction in DIRECTIONS
+            for direction in self.labels
         )
 
     def predict(self, context: Sequence[float]) -> PredictionSnapshot:
         """Freeze a prediction without training or changing any player state."""
         features = self._features(context)
         ready = self.samples >= self.min_samples
-        baseline_label = max(DIRECTIONS, key=self.counts.__getitem__)
+        baseline_label = max(self.labels, key=self.counts.__getitem__)
         prior = self._prior()
         if not ready:
             probabilities = prior
         else:
             raw = self._model.predict_proba(np.asarray([features], dtype=np.float64))[0]
-            # The estimator's classes are always [0, 1, 2, 3, 4].  An explicit
+            # The estimator's classes follow self.labels. An explicit
             # normalization also absorbs insignificant floating-point drift.
             total = float(raw.sum())
             if not np.isfinite(raw).all() or total <= 0:
@@ -141,14 +146,14 @@ class BehaviorPredictor:
             else:
                 probabilities = tuple(
                     _RECENT_WEIGHT * recent
-                    + (1.0 - _RECENT_WEIGHT) * float(value / total * 0.975 + 0.005)
+                    + (1.0 - _RECENT_WEIGHT) * float(value / total * 0.975 + 0.025 / len(self.labels))
                     for recent, value in zip(prior, raw)
                 )
-        best = max(range(len(DIRECTIONS)), key=probabilities.__getitem__)
+        best = max(range(len(self.labels)), key=probabilities.__getitem__)
         return PredictionSnapshot(
             features=features,
             probabilities=probabilities,
-            label=DIRECTIONS[best],
+            label=self.labels[best],
             confidence=probabilities[best],
             samples=self.samples,
             ready=ready,
@@ -162,15 +167,15 @@ class BehaviorPredictor:
         are used as-is instead of recomputing them with newer information.
         The caller should submit each completed response window exactly once.
         """
-        if actual not in DIRECTIONS:
-            raise ValueError(f"actual must be one of {DIRECTIONS!r}")
+        if actual not in self.labels:
+            raise ValueError(f"actual must be one of {self.labels!r}")
         if not isinstance(snapshot, PredictionSnapshot):
             raise TypeError("snapshot must be a PredictionSnapshot")
-        if len(snapshot.features) != _FEATURE_SIZE or not all(
+        if len(snapshot.features) != self.feature_size or not all(
             isfinite(value) for value in snapshot.features
         ):
-            raise ValueError(f"snapshot must contain {_FEATURE_SIZE} finite features")
-        if snapshot.label not in DIRECTIONS or snapshot.baseline_label not in DIRECTIONS:
+            raise ValueError(f"snapshot must contain {self.feature_size} finite features")
+        if snapshot.label not in self.labels or snapshot.baseline_label not in self.labels:
             raise ValueError("snapshot labels must be valid directions")
 
         # Score before training: otherwise the current answer would leak into
@@ -185,13 +190,13 @@ class BehaviorPredictor:
 
         self._model.partial_fit(
             np.asarray([snapshot.features], dtype=np.float64),
-            np.asarray([DIRECTIONS.index(actual)], dtype=np.int64),
-            classes=np.arange(len(DIRECTIONS), dtype=np.int64),
+            np.asarray([self.labels.index(actual)], dtype=np.int64),
+            classes=np.arange(len(self.labels), dtype=np.int64),
         )
 
         self.samples += 1
         self.counts[actual] += 1
-        for direction in DIRECTIONS:
+        for direction in self.labels:
             self._recent_counts[direction] *= _RECENCY_DECAY
         self._recent_counts[actual] += 1.0
         self.history.append(actual)

@@ -16,7 +16,7 @@ from uuid import uuid4
 
 _RECORDED_EVENTS = frozenset((
     "decision", "observation", "attack", "dash", "phase",
-    "player_hit", "boss_hit", "end",
+    "player_hit", "boss_hit", "boss_block", "end",
 ))
 
 
@@ -53,7 +53,7 @@ class SessionRecorder:
         try:
             self._write({
                 "type": "session_start",
-                "schema_version": 2,
+                "schema_version": 3,
                 "mode": mode,
                 "seed": seed,
                 "input_source": input_source,

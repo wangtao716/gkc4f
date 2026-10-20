@@ -22,7 +22,6 @@ from .engine import (
     FOLLOWUP_WARNING_DURATION, InputState, World,
 )
 from .input import KeyboardInput
-from .learning import DIRECTIONS
 from .pilot import SmokePilot as _SmokePilot
 from .telemetry import SessionRecorder
 
@@ -42,6 +41,10 @@ BLUE = (112, 193, 249)
 PURPLE = (187, 159, 254)
 LABELS = {"cw": "顺时针", "ccw": "逆时针", "in": "靠近", "out": "远离", "stay": "停留"}
 ARROWS = {"cw": "顺", "ccw": "逆", "in": "近", "out": "远", "stay": "停"}
+
+
+def response_label(direction: str, attack_kind: str) -> str:
+    return "未选边" if direction == "stay" and attack_kind == "sweep" else LABELS[direction]
 
 
 def ratio(numerator: float, denominator: float) -> float:
@@ -101,7 +104,7 @@ class GameApp:
         pygame.display.init()
         pygame.font.init()
         self.window = pygame.display.set_mode(SIZE, pygame.RESIZABLE)
-        pygame.display.set_caption("别让 AI 学会你 | 交锋 V0.2")
+        pygame.display.set_caption("别让 AI 学会你 | 交锋 V0.3")
         icon = pygame.Surface((32, 32), pygame.SRCALPHA)
         pygame.draw.polygon(icon, GREEN, [(16, 2), (29, 16), (16, 30), (3, 16)])
         pygame.draw.circle(icon, BG, (16, 16), 6)
@@ -128,6 +131,8 @@ class GameApp:
         self.visual_random = Random(123)
         self.hit_flash = 0.0
         self.boss_flash = 0.0
+        self.block_flash = 0.0
+        self.last_response_kind = "bomb"
         self.damage_numbers: list[tuple[float, float, str, tuple, float]] = []
         self._charge_ready = False
         self.toast = ""
@@ -143,9 +148,20 @@ class GameApp:
                 "reason": reason, "result": self.world.result,
                 "game_seconds": round(self.world.time, 3),
                 "player_hp": self.world.player.hp, "boss_hp": self.world.boss.hp,
-                "samples": self.world.predictor.samples,
-                "correct": self.world.predictor.correct,
-                "baseline_correct": self.world.predictor.baseline_correct,
+                "samples": self.world.total_samples,
+                "correct": self.world.total_correct,
+                "baseline_correct": self.world.total_baseline_correct,
+                "models": {kind: {"samples": model.samples, "correct": model.correct,
+                                  "baseline_correct": model.baseline_correct}
+                           for kind, model in self.world.predictors.items()},
+                "counter_attempts": self.world.counter_attempts,
+                "counter_hits": self.world.counter_hits,
+                "adaptive_counter_attempts": self.world.adaptive_counter_attempts,
+                "adaptive_counter_hits": self.world.adaptive_counter_hits,
+                "sweep_attempts": self.world.sweep_attempts,
+                "sweep_hits": self.world.sweep_hits,
+                "adaptive_sweep_attempts": self.world.adaptive_sweep_attempts,
+                "adaptive_sweep_hits": self.world.adaptive_sweep_hits,
             })
         except OSError:
             self.log_warning = True
@@ -160,7 +176,8 @@ class GameApp:
         self.damage_numbers.clear()
         self._charge_ready = False
         self.trail.clear()
-        self.hit_flash = self.boss_flash = 0.0
+        self.hit_flash = self.boss_flash = self.block_flash = 0.0
+        self.last_response_kind = "bomb"
         self.toast = "观察者已上线"
         self.toast_timer = 4.0
         self.log_path = None
@@ -187,12 +204,17 @@ class GameApp:
     def _game_events(self) -> None:
         for event in self.world.events:
             name = event["type"]
-            self.sound.play({"attack": "shot", "end": self.world.result or "win"}.get(name, name))
+            self.sound.play({"attack": "shot", "boss_block": "charge_cancel",
+                             "end": self.world.result or "win"}.get(name, name))
             if name == "boss_hit":
                 color = GREEN if event.get("exposed") else MUTED
                 self._burst(event["x"], event["y"], color, 12 if event.get("exposed") else 4)
                 self.damage_numbers.append((event["x"], event["y"]-22, str(event["damage"]), color, 0.65))
                 self.boss_flash = 0.08
+            elif name == "boss_block":
+                self._burst(event["x"], event["y"], AMBER, 7)
+                self.damage_numbers.append((event["x"], event["y"]-22, "弹开", AMBER, 0.55))
+                self.block_flash = 0.12
             elif name == "player_hit":
                 self._burst(event["x"], event["y"], GREEN, 18)
                 self.hit_flash = 0.28
@@ -205,7 +227,8 @@ class GameApp:
                 if cue:
                     self.sound.play(cue)
             elif name == "observation":
-                actual = LABELS[event["actual"]]
+                self.last_response_kind = event.get("attack_kind", self.world.attack_kind)
+                actual = response_label(event["actual"], self.last_response_kind)
                 self.toast = f"{actual} · {'走位被预判' if event['correct'] else '预判落空'}"
                 self.toast_timer = 2.2
             if self.recorder is not None:
@@ -233,6 +256,7 @@ class GameApp:
                                for x, y, value, color, life in self.damage_numbers if life > dt]
         self.hit_flash = max(0.0, self.hit_flash - dt)
         self.boss_flash = max(0.0, self.boss_flash - dt)
+        self.block_flash = max(0.0, self.block_flash - dt)
         self.toast_timer = max(0.0, self.toast_timer - dt)
         if self.world.player.dash_remaining > 0:
             self.trail.append((self.world.player.x, self.world.player.y))
@@ -366,7 +390,7 @@ class GameApp:
     def _menu(self) -> None:
         self._grid(self.canvas, 64, (23, 30, 31))
         self.text("ADAPTIVE ARENA", 64, 46, 17, GREEN, mono=True)
-        self.text("交锋  /  V0.2", 1216, 47, 15, MUTED, anchor="topright")
+        self.text("交锋  /  V0.3", 1216, 47, 15, MUTED, anchor="topright")
         self.text("别让 AI", 62, 135, 66, WHITE, True)
         self.text("学会你", 62, 220, 66, GREEN, True)
         self.text("对手：观察者", 65, 335, 23, MUTED)
@@ -397,7 +421,7 @@ class GameApp:
         self.text("OBSERVER", 932, 600, 23, WHITE, mono=True, anchor="midtop")
         self.text("装甲核心 / 已就绪", 932, 637, 15, MUTED, anchor="midtop")
         self.button((1065, 718, 149, 38), "声音 开" if self.sound.enabled else "声音 关", "sound", size=15)
-        self.text("SESSION / 02", 653, 725, 14, MUTED, mono=True)
+        self.text("SESSION / 03", 653, 725, 14, MUTED, mono=True)
 
     def _capsule(self, surface: pygame.Surface, color: tuple, start: tuple,
                  end: tuple, width: float) -> None:
@@ -446,22 +470,6 @@ class GameApp:
                 self._capsule(overlay, (*hue,alpha), start, end, max(1,hazard.width-4))
                 if live:
                     self._capsule(overlay, (255,240,223,240), start, end, 5)
-                if hazard.sweep_end_angle is not None:
-                    arc = hazard.sweep_end_angle-hazard.angle
-                    # These broken arcs show motion, not an already-live sector.
-                    for distance in (110, 190, 270):
-                        for index in range(8):
-                            a = hazard.angle+arc*index/8
-                            b = hazard.angle+arc*(index+0.6)/8
-                            pygame.draw.line(overlay, (*hue,130),
-                                (hazard.x+cos(a)*distance, hazard.y+sin(a)*distance),
-                                (hazard.x+cos(b)*distance, hazard.y+sin(b)*distance), 2)
-                        a = hazard.sweep_end_angle
-                        tip = (hazard.x+cos(a)*distance, hazard.y+sin(a)*distance)
-                        tangent = a+(pi/2 if arc >= 0 else -pi/2)
-                        wings = [(tip[0]-cos(tangent+offset)*11,tip[1]-sin(tangent+offset)*11)
-                                 for offset in (-0.55,0.55)]
-                        pygame.draw.lines(overlay, (*hue,230), False, [wings[0],tip,wings[1]], 2)
         stage.blit(overlay, (0,0))
         for index, position in enumerate(self.trail):
             pygame.draw.circle(stage, (28+index*3, 65+index*8, 61+index*6), position, 7+index//2)
@@ -485,6 +493,8 @@ class GameApp:
         core_radius = 17 if boss.exposed else 10
         pygame.draw.circle(stage, core_color, center, core_radius)
         pygame.draw.circle(stage, WHITE, center, 5)
+        if self.block_flash > 0:
+            pygame.draw.circle(stage, AMBER, center, 43, 3)
         barrel = (boss.x+cos(boss.facing)*50,boss.y+sin(boss.facing)*50)
         pygame.draw.line(stage, core_color, center, barrel, 3)
         self.fonts.draw(stage, "核心暴露" if boss.exposed else "装甲防御", boss.x, boss.y-79, 13,
@@ -534,6 +544,8 @@ class GameApp:
     def _sidebar(self) -> None:
         world, model = self.world, self.world.predictor
         prediction = world.prediction
+        hidden = world.decision_hidden
+        skill_name = "横扫" if world.attack_kind == "sweep" else "轰击"
         pygame.draw.line(self.canvas,LINE,(916,92),(916,770))
         phase_label, phase_color = {
             "idle": ("重整", MUTED), "aim": ("跟踪瞄准", AMBER),
@@ -554,47 +566,69 @@ class GameApp:
                      else ratio(world.phase_remaining,world.phase_duration))
         pygame.draw.rect(self.canvas,LINE,(940,190,288,4))
         pygame.draw.rect(self.canvas,phase_color,(940,190,round(288*remaining),4))
-        status = "正在针对" if world.using_prediction else "观察中" if self.mode=="adaptive" else "固定策略"
-        self.text(status,940,216,13,GREEN if world.using_prediction else MUTED)
-        self.text(world.tactic_label,1228,216,14,WHITE,anchor="topright")
+        if hidden:
+            status = "等待锁定" if world.phase == "aim" else "方向已封存"
+            tactic = "先选择逃离方向" if world.phase != "active" else "观察实际光束"
+        else:
+            status = "正在针对" if world.using_prediction else "观察中" if self.mode=="adaptive" else "固定策略"
+            tactic = world.tactic_label
+            if world.attack_kind == "sweep" and world.strategy_direction is not None:
+                tactic = f"本轮{LABELS[world.strategy_direction]}横扫"
+        self.text(status,940,216,13,MUTED if hidden else GREEN if world.using_prediction else MUTED)
+        self.text(tactic,1228,216,14,WHITE,anchor="topright")
         pygame.draw.line(self.canvas,LINE,(940,255),(1228,255))
-        self.text("走位预判",940,277,19,WHITE,True)
-        self.text(f"{model.samples:02d} 次观察",1228,283,13,MUTED,anchor="topright")
+        self.text(f"{skill_name}模型",940,277,19,WHITE,True)
+        self.text(f"本技能 {model.samples:02d} / 总计 {world.total_samples:02d}",1228,283,12,MUTED,anchor="topright")
         accuracy = f"{model.recent_accuracy*100:.0f}%" if model.samples else "--"
-        self.text("预测准确率",940,317,12,MUTED)
+        self.text("近期预测准确率",940,317,12,MUTED)
         self.text(accuracy,1228,313,20,GREEN,mono=True,anchor="topright")
-        probabilities = prediction.probabilities if prediction else (0.2,)*5
-        for index,direction in enumerate(DIRECTIONS):
-            y=358+index*30
-            color=GREEN if prediction and prediction.label==direction else MUTED
-            self.text(LABELS[direction],940,y,14,color)
-            pygame.draw.rect(self.canvas,(39,49,47),(1013,y+7,148,6))
-            width=round(148*probabilities[index])
-            if width:
-                pygame.draw.rect(self.canvas,color,(1013,y+7,width,6))
-            self.text(f"{probabilities[index]*100:.0f}%",1228,y,13,color,mono=True,anchor="topright")
+        if hidden:
+            self.panel((940,358,288,137),(28,35,35),LINE,6)
+            self.text("本轮预测暂不公开",1084,384,18,AMBER,True,anchor="midtop")
+            self.text("锁定后先行动，光束随后横扫",1084,427,14,MUTED,anchor="midtop")
+            self.text("攻击结束后显示预测结果",1084,454,13,MUTED,anchor="midtop")
+        elif prediction is None:
+            self.text("锁定时形成预测",940,381,16,MUTED)
+            self.text("依据该技能此前的完整观察",940,417,14,MUTED)
+        else:
+            for index,direction in enumerate(model.labels):
+                probability = prediction.probabilities[index]
+                y=358+index*30
+                color=GREEN if prediction.label==direction else MUTED
+                self.text(response_label(direction, world.attack_kind),940,y,14,color)
+                pygame.draw.rect(self.canvas,(39,49,47),(1013,y+7,148,6))
+                width=round(148*probability)
+                if width:
+                    pygame.draw.rect(self.canvas,color,(1013,y+7,width,6))
+                self.text(f"{probability*100:.0f}%",1228,y,13,color,mono=True,anchor="topright")
+            if world.attack_kind == "sweep":
+                self.text("未选边：未形成明显切向选择",940,470,13,MUTED)
         pygame.draw.line(self.canvas,LINE,(940,526),(1228,526))
-        self.text("追击实际命中",940,549,14,MUTED)
-        self.text(f"{world.counter_hits} / {world.counter_attempts}",1228,545,20,PURPLE,mono=True,anchor="topright")
-        self.text("上轮走位",940,585,13,MUTED)
+        self.text("横扫实际命中",940,546,14,MUTED)
+        self.text(f"{world.sweep_hits} / {world.sweep_attempts}",1228,542,19,AMBER,mono=True,anchor="topright")
+        self.text("轰击追击命中",940,579,14,MUTED)
+        self.text(f"{world.counter_hits} / {world.counter_attempts}",1228,575,19,PURPLE,mono=True,anchor="topright")
+        self.text("上轮走位",940,618,13,MUTED)
         if world.last_response:
             result="猜中" if world.last_prediction_hit else "落空"
-            self.text(f"{LABELS[world.last_response]} · {result}",1228,583,14,WHITE,anchor="topright")
+            actual = response_label(world.last_response, self.last_response_kind)
+            self.text(f"{actual} · {result}",1228,616,14,WHITE,anchor="topright")
         else:
-            self.text("等待观察",1228,583,14,MUTED,anchor="topright")
+            self.text("等待观察",1228,616,14,MUTED,anchor="topright")
         for index,direction in enumerate(model.history[-8:]):
-            box=pygame.Rect(940+index*36,623,29,29)
+            box=pygame.Rect(940+index*36,653,29,29)
             pygame.draw.rect(self.canvas,(33,43,40),box,border_radius=3)
-            self.text(ARROWS[direction],box.centerx,box.centery,14,GREEN if direction!="stay" else MUTED,anchor="center")
+            label = "未" if direction == "stay" and world.attack_kind == "sweep" else ARROWS[direction]
+            self.text(label,box.centerx,box.centery,14,GREEN if direction!="stay" else MUTED,anchor="center")
         if self.toast_timer > 0:
-            self.text(self.toast,940,678,14,MUTED)
+            self.text(self.toast,940,700,14,MUTED)
         self.text("ADAPTIVE" if self.mode=="adaptive" else "FIXED",940,737,12,GREEN if self.mode=="adaptive" else BLUE,mono=True)
         self.text("记录异常" if self.log_warning else "记录中" if self.record else "演练",1228,737,12,
                   AMBER if self.log_warning else MUTED,anchor="topright")
 
     def _game(self) -> None:
         self.text("别让 AI 学会你",28,23,28,WHITE,True)
-        self.text("交锋 / V0.2",300,34,13,MUTED)
+        self.text("交锋 / V0.3",300,34,13,MUTED)
         minutes,seconds=divmod(int(self.world.time),60)
         self.text(f"{minutes:02d}:{seconds:02d}",720,29,24,MUTED,mono=True)
         self.button((850,22,158,35),"C  换对手重开","switch",size=13)
@@ -620,7 +654,9 @@ class GameApp:
         self.text(f"{fraction*100:.0f}%",362,720,15,color,mono=True,anchor="topright")
         pygame.draw.rect(self.canvas,LINE,(28,748,334,5))
         pygame.draw.rect(self.canvas,AMBER,(28,748,round(334*fraction),5))
-        self.text("破绽增伤" if boss.exposed else "装甲减伤",410,720,14,GREEN if boss.exposed else MUTED)
+        pygame.draw.line(self.canvas,WHITE,(195,744),(195,757),1)
+        self.text("50% 最低蓄力",195,765,11,MUTED,anchor="midtop")
+        self.text("破绽伤害 ×1.65" if boss.exposed else "不足半蓄会被装甲弹开",410,720,14,GREEN if boss.exposed else MUTED)
         self.text(f"第 {self.world.completed_attacks+1:02d} 轮交锋",888,720,15,MUTED,anchor="topright")
         self.text("OBSERVER / ADAPTIVE COMBAT SYSTEM",410,747,11,MUTED,mono=True)
 
@@ -641,12 +677,13 @@ class GameApp:
             won=self.world.result=="win"
             self.text("你赢下了这场交锋" if won else "再试一种打法",640,231,32,GREEN if won else RED,True,anchor="midtop")
             self.text("观察者已被击败" if won else "观察者还记得你刚才的习惯",640,284,17,MUTED,anchor="midtop")
-            model=self.world.predictor
-            stats=[("对战用时",f"{self.world.time:.1f}s"),("走位猜中",f"{model.correct}/{model.samples}"),
-                   ("追击打中",f"{self.world.counter_hits}/{self.world.counter_attempts}")]
+            stats=[("对战用时",f"{self.world.time:.1f}s"),
+                   ("总走位猜中",f"{self.world.total_correct}/{self.world.total_samples}"),
+                   ("横扫命中",f"{self.world.sweep_hits}/{self.world.sweep_attempts}"),
+                   ("轰击追击",f"{self.world.counter_hits}/{self.world.counter_attempts}")]
             for index,(label,value) in enumerate(stats):
-                x=433+index*207
-                self.text(value,x,331,29,WHITE,mono=True,anchor="midtop")
+                x=415+index*150
+                self.text(value,x,331,25,WHITE,mono=True,anchor="midtop")
                 self.text(label,x,372,14,MUTED,anchor="midtop")
             self.button((386,424,508,55),"再来一局     ENTER","start",primary=True,size=20)
             self.button((386,496,245,44),"返回主菜单","menu")
@@ -701,7 +738,9 @@ class GameApp:
                 if not smoke_test or frame%6==0 or self.world.result:
                     self.render()
                     self.present()
-                if smoke_test and screenshot and not screenshot_saved and self.world.predictor.samples>=3 and self.world.phase=="lock" and self.world.phase_remaining<0.60:
+                if (smoke_test and screenshot and not screenshot_saved
+                        and self.world.attack_kind == "sweep" and self.world.predictor.samples >= 3
+                        and self.world.phase == "lock" and self.world.phase_remaining < 0.40):
                     self.render()
                     self.save_screenshot(screenshot)
                     screenshot_saved=True
@@ -712,7 +751,7 @@ class GameApp:
                 self.save_screenshot(screenshot)
             if smoke_test:
                 complete = self.world.result is not None
-                print(f"Smoke test {'OK' if complete else 'INCOMPLETE'}: mode={self.mode}, simulated_seconds={self.world.time:.2f}, samples={self.world.predictor.samples}, result={self.world.result}, hp={self.world.player.hp}")
+                print(f"Smoke test {'OK' if complete else 'INCOMPLETE'}: mode={self.mode}, simulated_seconds={self.world.time:.2f}, samples={self.world.total_samples}, result={self.world.result}, hp={self.world.player.hp}")
                 if not complete:
                     return 1
             return 0
