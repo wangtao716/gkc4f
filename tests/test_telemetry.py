@@ -21,7 +21,7 @@ def test_metadata_is_flushed_immediately_and_uses_utc(tmp_path):
         assert len(records) == 1
         start = records[0]
         assert start["type"] == "session_start"
-        assert start["schema_version"] == 1
+        assert start["schema_version"] == 2
         assert start["mode"] == "adaptive"
         assert start["seed"] == 7
         assert start["input_source"] == "keyboard"
@@ -42,25 +42,54 @@ def test_filters_events_and_preserves_original_fields_and_chinese(tmp_path, caps
     recorder = SessionRecorder(str(tmp_path), "fixed", 17)
     decision = {
         "type": "decision", "time": 1.0, "attack": "锁定轰击",
-        "prediction": "right", "context": [0.2, 0.4], "using_prediction": False,
-        "probabilities": {"right": 0.4, "none": 0.6},
+        "prediction": "cw", "context": [0.2, 0.4], "using_prediction": False,
+        "probabilities": {"cw": 0.4, "stay": 0.6},
     }
-    observation = {"type": "observation", "actual": "left", "correct": False}
+    observation = {"type": "observation", "actual": "ccw", "correct": False}
     ended = {"type": "end", "result": "win", "samples": 25}
+    attack = {"type": "attack", "charge": 0.8, "damage": 20}
+    dash = {"type": "dash", "move_x": 0.7, "move_y": 0.7}
+    player_hit = {"type": "player_hit", "damage": 16}
+    boss_hit = {"type": "boss_hit", "damage": 20}
+    phase = {"type": "phase", "phase": "lock", "attack_id": 2}
+    accepted = [attack, decision, dash, player_hit, observation, boss_hit, phase, ended]
     try:
-        for event in (
-            {"type": "attack"}, decision, {"type": "dash"}, {"type": "player_hit"},
-            observation, {"type": "boss_hit"}, {"unknown": 1}, ended,
-        ):
+        for event in [*accepted, {"unknown": 1}, {"type": "pointer_motion"}]:
             recorder.record(event)
         records = read_records(recorder.path)
-        assert records[1:] == [decision, observation, ended]
+        assert records[1:] == accepted
         assert "锁定轰击" in recorder.path.read_text(encoding="utf-8")
-        assert records[1] is not decision
+        assert records[2] is not decision
         assert decision["time"] == 1.0
     finally:
         recorder.close()
     assert capsys.readouterr().out == ""
+
+
+def test_prediction_correctness_and_real_counter_hits_remain_distinct(tmp_path):
+    recorder = SessionRecorder(tmp_path, "adaptive", 7)
+    decision = {
+        "type": "decision", "attack_id": 4, "prediction": "cw",
+        "using_prediction": True, "confidence": 0.7,
+    }
+    observation = {
+        "type": "observation", "attack_id": 4, "actual": "cw", "correct": True,
+    }
+    player_hit = {
+        "type": "player_hit", "attack_id": 4, "hazard_id": "main_blast",
+        "is_counter": False, "using_prediction": True, "damage": 16,
+    }
+    ended = {"type": "end", "counter_attempts": 1, "counter_hits": 0}
+    try:
+        for event in (decision, observation, player_hit, ended):
+            recorder.record(event)
+        records = read_records(recorder.path)
+        assert records[1:] == [decision, observation, player_hit, ended]
+        assert records[2]["correct"] is True
+        assert records[3]["is_counter"] is False
+        assert records[4]["counter_hits"] == 0
+    finally:
+        recorder.close()
 
 
 def test_independent_sessions_never_overwrite_even_with_same_start_time(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pygame
 
 from adaptive_boss.audio import SoundBank
+from adaptive_boss.engine import CHARGE_DURATION, FIXED_STEP, World
 from adaptive_boss.input import KeyboardInput
 
 
@@ -39,10 +40,70 @@ class KeyboardInputTests(unittest.TestCase):
 
     def test_attack_is_held_until_all_attack_keys_are_released(self):
         keyboard = KeyboardInput()
-        self.assertTrue(keyboard.poll([key_down(pygame.K_j)]).attack)
-        self.assertTrue(keyboard.poll([]).attack)
-        self.assertTrue(keyboard.poll([key_down(pygame.K_z), key_up(pygame.K_j)]).attack)
-        self.assertFalse(keyboard.poll([key_up(pygame.K_z)]).attack)
+        pressed = keyboard.poll([key_down(pygame.K_j)])
+        self.assertTrue(pressed.attack)
+        self.assertEqual(pressed.attack_edges, (True,))
+        held = keyboard.poll([])
+        self.assertTrue(held.attack)
+        self.assertEqual(held.attack_edges, ())
+        switched = keyboard.poll([key_down(pygame.K_z), key_up(pygame.K_j)])
+        self.assertTrue(switched.attack)
+        self.assertEqual(switched.attack_edges, ())
+        released = keyboard.poll([key_up(pygame.K_z)])
+        self.assertFalse(released.attack)
+        self.assertEqual(released.attack_edges, (False,))
+
+    def test_same_batch_release_and_repress_fires_then_starts_a_new_charge(self):
+        keyboard, world = KeyboardInput(), World()
+        world.update(CHARGE_DURATION, keyboard.poll([key_down(pygame.K_j)]))
+        controls = keyboard.poll([key_up(pygame.K_j), key_down(pygame.K_j)])
+        self.assertEqual(controls.attack_edges, (False, True))
+        world.update(FIXED_STEP, controls)
+        attacks = [event for event in world.events if event["type"] == "attack"]
+        self.assertEqual(len(attacks), 1)
+        self.assertEqual(attacks[0]["charge"], 1)
+        self.assertTrue(world.player.charging)
+        self.assertAlmostEqual(world.player.charge, FIXED_STEP)
+        self.assertEqual(keyboard.poll([]).attack_edges, ())
+
+    def test_same_batch_tap_produces_a_light_shot(self):
+        keyboard, world = KeyboardInput(), World()
+        controls = keyboard.poll([key_down(pygame.K_j), key_up(pygame.K_j)])
+        self.assertFalse(controls.attack)
+        self.assertEqual(controls.attack_edges, (True, False))
+        world.update(FIXED_STEP, controls)
+        attacks = [event for event in world.events if event["type"] == "attack"]
+        self.assertEqual(len(attacks), 1)
+        self.assertEqual(attacks[0]["charge"], 0)
+        self.assertFalse(world.player.charging)
+
+    def test_duplicate_attack_events_do_not_generate_extra_edges(self):
+        keyboard = KeyboardInput()
+        controls = keyboard.poll([
+            key_up(pygame.K_j), key_down(pygame.K_j, repeat=True),
+            key_down(pygame.K_j), key_down(pygame.K_j),
+            key_down(pygame.K_j, repeat=True), key_up(pygame.K_j),
+            key_up(pygame.K_j),
+        ])
+        self.assertEqual(controls.attack_edges, (True, False))
+        self.assertFalse(controls.attack)
+
+    def test_focus_loss_discards_attack_edges_without_creating_a_release(self):
+        focus_events = [
+            pygame.event.Event(pygame.WINDOWFOCUSLOST),
+            pygame.event.Event(pygame.ACTIVEEVENT, gain=0, state=pygame.APPINPUTFOCUS),
+        ]
+        for event in focus_events:
+            with self.subTest(event=event.type):
+                keyboard = KeyboardInput()
+                keyboard.poll([key_down(pygame.K_j)])
+                controls = keyboard.poll([
+                    key_up(pygame.K_j), key_down(pygame.K_j), event,
+                ])
+                self.assertFalse(controls.attack)
+                self.assertEqual(controls.attack_edges, ())
+                self.assertEqual(keyboard.poll([key_up(pygame.K_j)]).attack_edges, ())
+                self.assertEqual(keyboard.poll([key_down(pygame.K_j)]).attack_edges, (True,))
 
     def test_dash_is_a_press_pulse_and_key_repeats_do_not_retrigger(self):
         keyboard = KeyboardInput()
@@ -135,6 +196,7 @@ class SoundBankTests(unittest.TestCase):
             assert set(bank._sounds) == {
                 'shot', 'dash', 'player_hit', 'boss_hit',
                 'decision', 'win', 'lose', 'click',
+                'lock', 'counter', 'exposed', 'charged', 'charge_cancel',
             }
             for name, sound in bank._sounds.items():
                 assert 0.0 < sound.get_length() < 0.6

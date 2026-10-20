@@ -17,27 +17,31 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 
 from .audio import SoundBank
-from .engine import DASH_COOLDOWN, WINDUP_DURATION, InputState, World, hazard_hits
+from .engine import (
+    CHARGE_DURATION, DASH_COOLDOWN, FOLLOWUP_ACTIVE_DURATION,
+    FOLLOWUP_WARNING_DURATION, InputState, World,
+)
 from .input import KeyboardInput
 from .learning import DIRECTIONS
+from .pilot import SmokePilot as _SmokePilot
 from .telemetry import SessionRecorder
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SIZE = (1280, 800)
 ARENA = pygame.Rect(28, 158, 860, 540)
-BG = (9, 15, 24)
-PANEL = (17, 26, 39)
-LINE = (40, 56, 73)
-WHITE = (231, 239, 247)
-MUTED = (139, 159, 178)
+BG = (15, 18, 20)
+PANEL = (24, 29, 31)
+LINE = (53, 64, 66)
+WHITE = (233, 239, 237)
+MUTED = (148, 164, 162)
 GREEN = (114, 239, 183)
 RED = (255, 116, 130)
 AMBER = (255, 198, 113)
 BLUE = (112, 193, 249)
 PURPLE = (187, 159, 254)
-LABELS = {"up": "向上", "down": "向下", "left": "向左", "right": "向右", "none": "未闪避"}
-ARROWS = {"up": "↑", "down": "↓", "left": "←", "right": "→", "none": "·"}
+LABELS = {"cw": "顺时针", "ccw": "逆时针", "in": "靠近", "out": "远离", "stay": "停留"}
+ARROWS = {"cw": "顺", "ccw": "逆", "in": "近", "out": "远", "stay": "停"}
 
 
 def ratio(numerator: float, denominator: float) -> float:
@@ -88,48 +92,6 @@ class Spark:
     color: tuple
 
 
-class _SmokePilot:
-    """A bounded test pilot that reacts only to the visible warning geometry."""
-
-    def __init__(self) -> None:
-        self.attack_number = -1
-        self.target: tuple[float, float] | None = None
-
-    def controls(self, world: World) -> InputState:
-        player = world.player
-        dash = False
-        if world.phase == "windup" and self.attack_number != world.completed_attacks:
-            self.attack_number = world.completed_attacks
-            candidates = []
-            # Prefer right when it is safe: repeated real responses make the
-            # predictor's learning stage visible without manufacturing labels.
-            for preference, (dx, dy) in enumerate(((1,0),(0,-1),(0,1),(-1,0),(1,-1),(1,1),(-1,-1),(-1,1))):
-                norm = hypot(dx, dy)
-                for distance in (125,150,170):
-                    x = player.x+dx/norm*distance
-                    y = player.y+dy/norm*distance
-                    if not (20 <= x <= world.width-20 and 20 <= y <= world.height-20):
-                        continue
-                    if any(hazard_hits(hazard,x,y,player.radius+17) for hazard in world.hazards):
-                        continue
-                    candidates.append((preference*25+abs(distance-125),x,y))
-            if candidates:
-                _, x, y = min(candidates)
-                self.target = (x,y)
-                dash = True
-            else:
-                self.target = (world.width/2,world.height*.8)
-        if self.target is None:
-            return InputState(attack=True)
-        dx, dy = self.target[0]-player.x, self.target[1]-player.y
-        distance = hypot(dx,dy)
-        if distance < 3:
-            dx = dy = 0.0
-        else:
-            dx,dy=dx/distance,dy/distance
-        return InputState(dx,dy,True,dash)
-
-
 class GameApp:
     def __init__(self, mode: str = "adaptive", seed: int = 7, mute: bool = False,
                  headless: bool = False, record: bool = True) -> None:
@@ -139,7 +101,7 @@ class GameApp:
         pygame.display.init()
         pygame.font.init()
         self.window = pygame.display.set_mode(SIZE, pygame.RESIZABLE)
-        pygame.display.set_caption("别让 AI 学会你 | Adaptive Arena")
+        pygame.display.set_caption("别让 AI 学会你 | 交锋 V0.2")
         icon = pygame.Surface((32, 32), pygame.SRCALPHA)
         pygame.draw.polygon(icon, GREEN, [(16, 2), (29, 16), (16, 30), (3, 16)])
         pygame.draw.circle(icon, BG, (16, 16), 6)
@@ -166,6 +128,8 @@ class GameApp:
         self.visual_random = Random(123)
         self.hit_flash = 0.0
         self.boss_flash = 0.0
+        self.damage_numbers: list[tuple[float, float, str, tuple, float]] = []
+        self._charge_ready = False
         self.toast = ""
         self.toast_timer = 0.0
         self.buttons: list[tuple[pygame.Rect, str]] = []
@@ -193,9 +157,11 @@ class GameApp:
         self.world.reset(self.mode)
         self.keyboard.reset()
         self.sparks.clear()
+        self.damage_numbers.clear()
+        self._charge_ready = False
         self.trail.clear()
         self.hit_flash = self.boss_flash = 0.0
-        self.toast = "先熟悉招式，再试着改变你的闪避习惯。"
+        self.toast = "观察者已上线"
         self.toast_timer = 4.0
         self.log_path = None
         self.log_warning = False
@@ -223,21 +189,24 @@ class GameApp:
             name = event["type"]
             self.sound.play({"attack": "shot", "end": self.world.result or "win"}.get(name, name))
             if name == "boss_hit":
-                self._burst(event["x"], event["y"], RED, 5)
+                color = GREEN if event.get("exposed") else MUTED
+                self._burst(event["x"], event["y"], color, 12 if event.get("exposed") else 4)
+                self.damage_numbers.append((event["x"], event["y"]-22, str(event["damage"]), color, 0.65))
                 self.boss_flash = 0.08
             elif name == "player_hit":
                 self._burst(event["x"], event["y"], GREEN, 18)
                 self.hit_flash = 0.28
             elif name == "dash":
                 self._burst(event["x"], event["y"], GREEN, 8)
+                if self._charge_ready:
+                    self.sound.play("charge_cancel")
+            elif name == "phase":
+                cue = {"lock": "lock", "followup": "counter", "recovery": "exposed"}.get(event["phase"])
+                if cue:
+                    self.sound.play(cue)
             elif name == "observation":
                 actual = LABELS[event["actual"]]
-                if event["actual"] == "none":
-                    self.toast = "这一轮没有闪避，已记入观察。"
-                elif event["correct"]:
-                    self.toast = f"你选择{actual}，对手猜中了。试试换个方向！"
-                else:
-                    self.toast = f"你选择{actual}，这次没有被看穿。"
+                self.toast = f"{actual} · {'走位被预判' if event['correct'] else '预判落空'}"
                 self.toast_timer = 2.2
             if self.recorder is not None:
                 try:
@@ -256,6 +225,12 @@ class GameApp:
             return
         self.world.update(dt, controls or InputState())
         self._game_events()
+        charged = self.world.player.charge >= CHARGE_DURATION - 1e-6
+        if charged and not self._charge_ready:
+            self.sound.play("charged")
+        self._charge_ready = charged
+        self.damage_numbers = [(x, y-dt*32, value, color, life-dt)
+                               for x, y, value, color, life in self.damage_numbers if life > dt]
         self.hit_flash = max(0.0, self.hit_flash - dt)
         self.boss_flash = max(0.0, self.boss_flash - dt)
         self.toast_timer = max(0.0, self.toast_timer - dt)
@@ -285,6 +260,7 @@ class GameApp:
             if self.scene == "playing":
                 self.scene = "paused"
                 self.keyboard.reset()
+                self.world.cancel_actions()
         elif action == "resume":
             self.scene = "playing"
             self.keyboard.reset()
@@ -292,6 +268,7 @@ class GameApp:
             self._close_record("menu")
             self.scene = "menu"
             self.keyboard.reset()
+            self.world.cancel_actions()
         elif action == "sound":
             self.sound.set_enabled(not self.sound.enabled)
         elif action == "switch":
@@ -307,28 +284,36 @@ class GameApp:
         # Respect event order: starting/resuming resets old held keys, while a
         # movement key pressed *after* Enter in this batch must remain held.
         dash_requested = False
+        attack_edges: list[bool] = []
         for event in events:
             instant = self.keyboard.poll([event])
             dash_requested = dash_requested or instant.dash
+            attack_edges.extend(instant.attack_edges)
             if event.type == pygame.QUIT:
                 self.running = False
-            elif event.type == pygame.WINDOWFOCUSLOST and self.scene == "playing" and not self.headless:
-                self._action("pause")
+            elif event.type == pygame.WINDOWFOCUSLOST:
+                dash_requested = False
+                attack_edges.clear()
+                if self.scene == "playing" and not self.headless:
+                    self._action("pause")
             elif event.type == pygame.KEYDOWN and not getattr(event, "repeat", False):
                 if event.key == pygame.K_m:
                     self._action("sound")
                 elif event.key == pygame.K_c:
                     self._action("switch")
                     dash_requested = False
+                    attack_edges.clear()
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     if self.scene in ("menu", "result"):
                         self._action("start")
                     elif self.scene == "paused":
                         self._action("resume")
                     dash_requested = False
+                    attack_edges.clear()
                 elif event.key == pygame.K_r and self.scene != "menu":
                     self.start_match()
                     dash_requested = False
+                    attack_edges.clear()
                 elif event.key == pygame.K_ESCAPE:
                     if self.scene == "playing":
                         self._action("pause")
@@ -337,22 +322,26 @@ class GameApp:
                     else:
                         self._action("quit")
                     dash_requested = False
+                    attack_edges.clear()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mouse = self.mouse_position(event.pos)
                 for rect, action in reversed(self.buttons):
                     if rect.collidepoint(mouse):
                         self._action(action)
-                        dash_requested = False
+                        if action not in ("sound", "adaptive", "fixed"):
+                            dash_requested = False
+                            attack_edges.clear()
                         break
         held = self.keyboard.poll([])
         return InputState(held.move_x, held.move_y, held.attack,
-                          dash_requested and self.scene == "playing")
+                          dash_requested and self.scene == "playing",
+                          tuple(attack_edges) if self.scene == "playing" else ())
 
     def text(self, value: object, x: float, y: float, size: int = 18,
              color: tuple = WHITE, bold: bool = False, **kwargs) -> pygame.Rect:
         return self.fonts.draw(self.canvas, value, x, y, size, color, bold, **kwargs)
 
-    def panel(self, rect: tuple | pygame.Rect, fill: tuple = PANEL, border: tuple = LINE, radius: int = 16) -> None:
+    def panel(self, rect: tuple | pygame.Rect, fill: tuple = PANEL, border: tuple = LINE, radius: int = 8) -> None:
         pygame.draw.rect(self.canvas, fill, rect, border_radius=radius)
         pygame.draw.rect(self.canvas, border, rect, 1, border_radius=radius)
 
@@ -362,7 +351,7 @@ class GameApp:
         hover = box.collidepoint(self.mouse_position()) and not self.headless
         fill = GREEN if primary else (27, 47, 49) if selected else (27, 39, 55) if hover else PANEL
         border = GREEN if selected or primary else (82, 110, 136) if hover else LINE
-        self.panel(box, fill, border, 10)
+        self.panel(box, fill, border, 6)
         self.text(label, box.centerx, box.centery, size, BG if primary else WHITE,
                   bold=primary, anchor="center")
         self.buttons.append((box, action))
@@ -375,24 +364,22 @@ class GameApp:
             pygame.draw.line(surface, color, (0, y), (width, y))
 
     def _menu(self) -> None:
-        self._grid(self.canvas, 64, (15, 25, 37))
+        self._grid(self.canvas, 64, (23, 30, 31))
         self.text("ADAPTIVE ARENA", 64, 46, 17, GREEN, mono=True)
-        self.text("键盘原型  /  V0.1", 1216, 47, 15, MUTED, anchor="topright")
+        self.text("交锋  /  V0.2", 1216, 47, 15, MUTED, anchor="topright")
         self.text("别让 AI", 62, 135, 66, WHITE, True)
         self.text("学会你", 62, 220, 66, GREEN, True)
-        self.text("对手会记住你的习惯。你能骗过它吗？", 65, 320, 23, MUTED)
-        self.text("移动、射击、闪避，击败竞技场中的观察者。", 65, 365, 17, MUTED)
+        self.text("对手：观察者", 65, 335, 23, MUTED)
         self.text("选一个对手", 66, 430, 17, WHITE, True)
         self.button((64, 470, 246, 72), "自适应对手", "adaptive", selected=self.mode == "adaptive", size=20)
         self.button((326, 470, 246, 72), "固定策略", "fixed", selected=self.mode == "fixed", size=20)
-        description = "先观察，再尝试预判你的下一次闪避。" if self.mode == "adaptive" else "招式按固定规则选择，适合熟悉操作。"
-        self.text(description, 66, 558, 16, MUTED)
+        description = "实时学习" if self.mode == "adaptive" else "基准对手"
+        self.text(description, 66, 558, 16, GREEN if self.mode == "adaptive" else BLUE)
         self.button((64, 614, 508, 62), "开始挑战     ENTER", "start", primary=True, size=21)
-        self.text("WASD 移动      J 射击      SPACE 闪避", 67, 701, 17, MUTED)
-        self.panel((650, 134, 564, 545), (13, 22, 34), LINE, 22)
+        self.text("竞技场 01 / 单人挑战", 67, 701, 15, MUTED)
         center = (932, 358)
         for radius in (82, 148, 210):
-            pygame.draw.circle(self.canvas, (34, 49, 63), center, radius, 1)
+            pygame.draw.circle(self.canvas, (42, 52, 51), center, radius, 1)
         pygame.draw.line(self.canvas, LINE, (698, 358), (1166, 358), 1)
         pygame.draw.line(self.canvas, LINE, (932, 164), (932, 560), 1)
         angle = self.ui_time * 0.24
@@ -407,10 +394,10 @@ class GameApp:
         pygame.draw.polygon(self.canvas, GREEN, [(px, py-16), (px+14,py), (px,py+16), (px-14,py)])
         pygame.draw.line(self.canvas, (66, 109, 103), (px,py), center, 1)
         self.text("你", px+30, py-12, 17, GREEN)
-        self.text("观察 → 预测 → 反制", 932, 600, 23, WHITE, anchor="midtop")
-        self.text("改变习惯，让它重新认识你。", 932, 637, 15, MUTED, anchor="midtop")
+        self.text("OBSERVER", 932, 600, 23, WHITE, mono=True, anchor="midtop")
+        self.text("装甲核心 / 已就绪", 932, 637, 15, MUTED, anchor="midtop")
         self.button((1065, 718, 149, 38), "声音 开" if self.sound.enabled else "声音 关", "sound", size=15)
-        self.text("C 切换对手   ·   每局从新的学习记录开始", 653, 725, 14, MUTED)
+        self.text("SESSION / 02", 653, 725, 14, MUTED, mono=True)
 
     def _capsule(self, surface: pygame.Surface, color: tuple, start: tuple,
                  end: tuple, width: float) -> None:
@@ -422,57 +409,90 @@ class GameApp:
     def _arena(self) -> None:
         world = self.world
         stage = self.arena_surface
-        stage.fill((12, 21, 32))
-        self._grid(stage)
+        stage.fill((18, 23, 24))
+        self._grid(stage, color=(29, 37, 37))
         for x, y, sx, sy in [(12,12,1,1),(848,12,-1,1),(12,528,1,-1),(848,528,-1,-1)]:
-            pygame.draw.line(stage, (63, 85, 104), (x,y), (x+sx*22,y), 2)
-            pygame.draw.line(stage, (63, 85, 104), (x,y), (x,y+sy*22), 2)
-        pygame.draw.circle(stage, (24, 36, 49), (round(world.boss.x), round(world.boss.y)), 104, 1)
+            pygame.draw.line(stage, LINE, (x,y), (x+sx*22,y), 2)
+            pygame.draw.line(stage, LINE, (x,y), (x,y+sy*22), 2)
+        pygame.draw.circle(stage, (37, 47, 45), (round(world.boss.x), round(world.boss.y)), 104, 1)
         overlay = self.hazard_surface
         overlay.fill((0, 0, 0, 0))
-        if world.phase in ("windup", "active"):
-            live = world.phase == "active"
-            progress = 1-ratio(world.phase_remaining, WINDUP_DURATION) if not live else 1.0
-            for hazard in world.hazards:
-                hue = PURPLE if hazard.is_counter else RED if live else AMBER
-                alpha = 125 if live else 34
-                if hazard.kind == "circle":
-                    center = (round(hazard.x), round(hazard.y))
-                    radius = round(hazard.radius)
-                    pygame.draw.circle(overlay, (*hue, alpha), center, radius)
-                    pygame.draw.circle(overlay, (*hue, 230), center, radius, 2)
-                    if not live:
-                        box = pygame.Rect(center[0]-radius-5, center[1]-radius-5, 2*radius+10, 2*radius+10)
-                        pygame.draw.arc(overlay, (*hue,255), box, -pi/2, -pi/2 + max(0.001,progress)*2*pi, 3)
-                    pygame.draw.line(overlay, (*hue, 220), (center[0]-8,center[1]), (center[0]+8,center[1]), 1)
-                    pygame.draw.line(overlay, (*hue, 220), (center[0],center[1]-8), (center[0],center[1]+8), 1)
+        for hazard in world.hazards:
+            live, progress = hazard.active, hazard.progress
+            hue = RED if live else PURPLE if hazard.is_counter else AMBER
+            alpha = 150 if live else 25 if world.phase == "aim" else 45
+            if hazard.kind == "circle":
+                center = (round(hazard.x), round(hazard.y))
+                radius = round(hazard.radius)
+                pygame.draw.circle(overlay, (*hue, alpha), center, radius)
+                if world.phase == "aim":
+                    box = pygame.Rect(center[0]-radius, center[1]-radius, radius*2, radius*2)
+                    for index in range(12):
+                        start = index*pi/6 + self.ui_time*0.6
+                        pygame.draw.arc(overlay, (*hue, 180), box, start, start+pi/9, 2)
                 else:
-                    start = (hazard.x, hazard.y)
-                    end = (hazard.x+cos(hazard.angle)*hazard.length, hazard.y+sin(hazard.angle)*hazard.length)
-                    self._capsule(overlay, (*hue,180), start, end, hazard.width)
-                    self._capsule(overlay, (*hue,alpha), start, end, max(1,hazard.width-4))
-                    if live:
-                        self._capsule(overlay, (255,240,223,225), start, end, 4)
+                    pygame.draw.circle(overlay, (*hue, 240), center, radius, 3 if live else 2)
+                if not live:
+                    countdown = max(3, round(radius*(1-progress)))
+                    pygame.draw.circle(overlay, (*hue, 150), center, countdown, 1)
+                else:
+                    pygame.draw.circle(overlay, (255,240,222,190), center, max(2,round(radius*progress)), 2)
+                pygame.draw.line(overlay, (*hue, 230), (center[0]-9,center[1]), (center[0]+9,center[1]), 2)
+                pygame.draw.line(overlay, (*hue, 230), (center[0],center[1]-9), (center[0],center[1]+9), 2)
+            else:
+                start = (hazard.x, hazard.y)
+                end = (hazard.x+cos(hazard.angle)*hazard.length, hazard.y+sin(hazard.angle)*hazard.length)
+                self._capsule(overlay, (*hue,190), start, end, hazard.width)
+                self._capsule(overlay, (*hue,alpha), start, end, max(1,hazard.width-4))
+                if live:
+                    self._capsule(overlay, (255,240,223,240), start, end, 5)
+                if hazard.sweep_end_angle is not None:
+                    arc = hazard.sweep_end_angle-hazard.angle
+                    # These broken arcs show motion, not an already-live sector.
+                    for distance in (110, 190, 270):
+                        for index in range(8):
+                            a = hazard.angle+arc*index/8
+                            b = hazard.angle+arc*(index+0.6)/8
+                            pygame.draw.line(overlay, (*hue,130),
+                                (hazard.x+cos(a)*distance, hazard.y+sin(a)*distance),
+                                (hazard.x+cos(b)*distance, hazard.y+sin(b)*distance), 2)
+                        a = hazard.sweep_end_angle
+                        tip = (hazard.x+cos(a)*distance, hazard.y+sin(a)*distance)
+                        tangent = a+(pi/2 if arc >= 0 else -pi/2)
+                        wings = [(tip[0]-cos(tangent+offset)*11,tip[1]-sin(tangent+offset)*11)
+                                 for offset in (-0.55,0.55)]
+                        pygame.draw.lines(overlay, (*hue,230), False, [wings[0],tip,wings[1]], 2)
         stage.blit(overlay, (0,0))
         for index, position in enumerate(self.trail):
             pygame.draw.circle(stage, (28+index*3, 65+index*8, 61+index*6), position, 7+index//2)
         for shot in world.projectiles:
             speed = hypot(shot.vx, shot.vy) or 1
             tail = (shot.x - shot.vx/speed*14, shot.y-shot.vy/speed*14)
-            pygame.draw.line(stage, (55,107,120), tail, (shot.x,shot.y), 5)
+            pygame.draw.line(stage, (67,132,113), tail, (shot.x,shot.y), round(shot.radius))
             pygame.draw.circle(stage, GREEN, (round(shot.x),round(shot.y)), round(shot.radius))
+            pygame.draw.circle(stage, WHITE, (round(shot.x),round(shot.y)), max(2,round(shot.radius/2)))
         boss = world.boss
-        angle = self.ui_time * 0.35
-        points = [(boss.x+cos(angle+i*pi/4)*boss.radius, boss.y+sin(angle+i*pi/4)*boss.radius) for i in range(8)]
-        pygame.draw.circle(stage, (35,27,41), (round(boss.x),round(boss.y)), 45)
-        pygame.draw.polygon(stage, WHITE if self.boss_flash else (70,35,48), points)
-        pygame.draw.polygon(stage, RED, points, 2)
-        pygame.draw.circle(stage, RED, (round(boss.x),round(boss.y)), 9)
-        pygame.draw.circle(stage, (255,214,214), (round(boss.x),round(boss.y)), 3)
-        if world.phase == "windup":
-            box = pygame.Rect(boss.x-47,boss.y-47,94,94)
-            pygame.draw.arc(stage, AMBER, box, -pi/2, -pi/2+max(0.001,1-world.phase_remaining)*2*pi, 3)
-        self.fonts.draw(stage, "OBSERVER", boss.x, boss.y-63, 11, MUTED, mono=True, anchor="midtop")
+        core_color = GREEN if boss.exposed else RED
+        center = (round(boss.x),round(boss.y))
+        pygame.draw.circle(stage, (29,39,36) if boss.exposed else (45,31,35), center, 44)
+        for index in range(6):
+            a = boss.facing+index*pi/3
+            inner, outer = (40,57) if boss.exposed else (22,39)
+            points = [(boss.x+cos(a+offset)*r,boss.y+sin(a+offset)*r)
+                      for offset,r in ((-0.42,inner),(-0.38,outer),(0.38,outer),(0.42,inner))]
+            pygame.draw.polygon(stage, WHITE if self.boss_flash else (66,74,72), points)
+            pygame.draw.polygon(stage, core_color if boss.exposed else (169,126,127), points, 1)
+        core_radius = 17 if boss.exposed else 10
+        pygame.draw.circle(stage, core_color, center, core_radius)
+        pygame.draw.circle(stage, WHITE, center, 5)
+        barrel = (boss.x+cos(boss.facing)*50,boss.y+sin(boss.facing)*50)
+        pygame.draw.line(stage, core_color, center, barrel, 3)
+        self.fonts.draw(stage, "核心暴露" if boss.exposed else "装甲防御", boss.x, boss.y-79, 13,
+                        core_color if boss.exposed else MUTED, anchor="midtop")
+        if boss.exposed:
+            box = pygame.Rect(boss.x-65,boss.y-65,130,130)
+            pygame.draw.arc(stage, GREEN, box, -pi/2,
+                            -pi/2+max(0.001,ratio(world.phase_remaining,world.phase_duration))*2*pi, 2)
         player = world.player
         center = (round(player.x),round(player.y))
         pygame.draw.circle(stage, (29,57,56), center, 21)
@@ -483,20 +503,25 @@ class GameApp:
                     (player.x+cos(facing+2.35)*10,player.y+sin(facing+2.35)*10),
                     (player.x+cos(facing-2.35)*10,player.y+sin(facing-2.35)*10)]
         pygame.draw.polygon(stage, GREEN if not blink else WHITE, vertices)
-        self.fonts.draw(stage, "YOU", player.x, player.y+24, 11, GREEN, mono=True, anchor="midtop")
+        if player.charging:
+            fraction = ratio(player.charge, CHARGE_DURATION)
+            color = AMBER if fraction < 1 else WHITE
+            box = pygame.Rect(player.x-27,player.y-27,54,54)
+            pygame.draw.arc(stage,color,box,-pi/2,-pi/2+max(0.001,fraction)*2*pi,3)
+            for index in range(1,8):
+                t = index/8
+                pygame.draw.circle(stage,(61,93,81),(round(player.x+(boss.x-player.x)*t),
+                                                    round(player.y+(boss.y-player.y)*t)),1)
+        label_y = min(world.height-16,player.y+31)
+        self.fonts.draw(stage, "YOU", player.x, label_y, 10, GREEN, mono=True, anchor="midtop")
+        for x,y,value,color,life in self.damage_numbers:
+            self.fonts.draw(stage,value,x,y,20,color,True,anchor="midbottom")
         for spark in self.sparks:
             size=max(1,round(3*spark.remaining/spark.lifetime))
             pygame.draw.circle(stage,spark.color,(round(spark.x),round(spark.y)),size)
         self.canvas.blit(stage, ARENA)
         border = RED if self.hit_flash > 0 else LINE
         pygame.draw.rect(self.canvas,border,ARENA,2 if self.hit_flash else 1)
-        if world.phase in ("windup","active"):
-            label = f"{world.attack_name}  /  {world.phase_remaining:.1f}s" if world.phase=="windup" else f"{world.attack_name}  /  危险区域已生效"
-            self.panel((45,171,340,33),(31,28,28),(111,86,58),7)
-            self.text(label,58,177,14,AMBER)
-            self.text("紫色标记：反制落点",868,178,12,PURPLE,anchor="topright")
-        elif self.toast_timer > 0:
-            self.text(self.toast, ARENA.centerx, 175, 15, MUTED, anchor="midtop")
 
     def _meter(self, x: int, label: str, current: float, maximum: float, color: tuple, width: int) -> None:
         self.text(label,x,92,15,MUTED)
@@ -507,100 +532,118 @@ class GameApp:
             pygame.draw.rect(self.canvas,color,(x,122,fill,8),border_radius=4)
 
     def _sidebar(self) -> None:
-        world = self.world
-        model = world.predictor
+        world, model = self.world, self.world.predictor
         prediction = world.prediction
-        self.panel((916,92,336,606))
-        self.text("对手的观察",940,112,21,WHITE,True)
-        status = "学习模式" if self.mode=="adaptive" else "固定策略"
-        self.text(status,1228,117,14,GREEN if self.mode=="adaptive" else BLUE,anchor="topright")
-        warm = model.samples < model.min_samples
-        self.text(f"正在熟悉你  {model.samples} / {model.min_samples}" if warm else "正在观察你的习惯",940,151,14,MUTED)
-        self.text(f"{model.samples:02d}",940,181,34,GREEN,mono=True)
-        self.text("条响应记录",940,225,13,MUTED)
+        pygame.draw.line(self.canvas,LINE,(916,92),(916,770))
+        phase_label, phase_color = {
+            "idle": ("重整", MUTED), "aim": ("跟踪瞄准", AMBER),
+            "lock": ("已锁定", AMBER), "active": ("攻击生效", RED),
+            "followup": ("追击生效", RED) if any(h.active for h in world.hazards) else ("追击预警", PURPLE),
+            "recovery": ("核心暴露", GREEN),
+        }[world.phase]
+        self.text("OBSERVER / 01",940,94,12,MUTED,mono=True)
+        self.text(phase_label,940,120,24,phase_color,True)
+        stage_remaining = world.phase_remaining
+        if world.phase == "followup" and world.hazards:
+            hazard = world.hazards[0]
+            duration = FOLLOWUP_ACTIVE_DURATION if hazard.active else FOLLOWUP_WARNING_DURATION
+            stage_remaining = duration*(1-hazard.progress)
+        self.text(f"{stage_remaining:.1f}s",1228,126,18,phase_color,mono=True,anchor="topright")
+        self.text(world.attack_name,940,161,15,WHITE)
+        remaining = (1-world.hazards[0].progress if world.phase == "followup" and world.hazards
+                     else ratio(world.phase_remaining,world.phase_duration))
+        pygame.draw.rect(self.canvas,LINE,(940,190,288,4))
+        pygame.draw.rect(self.canvas,phase_color,(940,190,round(288*remaining),4))
+        status = "正在针对" if world.using_prediction else "观察中" if self.mode=="adaptive" else "固定策略"
+        self.text(status,940,216,13,GREEN if world.using_prediction else MUTED)
+        self.text(world.tactic_label,1228,216,14,WHITE,anchor="topright")
+        pygame.draw.line(self.canvas,LINE,(940,255),(1228,255))
+        self.text("走位预判",940,277,19,WHITE,True)
+        self.text(f"{model.samples:02d} 次观察",1228,283,13,MUTED,anchor="topright")
         accuracy = f"{model.recent_accuracy*100:.0f}%" if model.samples else "--"
-        self.text(accuracy,1110,181,34,WHITE,mono=True)
-        self.text("最近 20 次命中率",1110,225,13,MUTED)
-        pygame.draw.line(self.canvas,LINE,(940,259),(1228,259))
-        self.text("下一次闪避",940,276,17,WHITE,True)
-        self.text("本轮预警开始时的判断",940,304,12,MUTED)
+        self.text("预测准确率",940,317,12,MUTED)
+        self.text(accuracy,1228,313,20,GREEN,mono=True,anchor="topright")
         probabilities = prediction.probabilities if prediction else (0.2,)*5
         for index,direction in enumerate(DIRECTIONS):
-            y=337+index*32
-            highlight = prediction is not None and prediction.label==direction
-            color=GREEN if highlight else MUTED
-            self.text(LABELS[direction],940,y,15,color)
-            pygame.draw.rect(self.canvas,(31,44,58),(1007,y+7,163,7),border_radius=3)
-            width=round(163*probabilities[index])
+            y=358+index*30
+            color=GREEN if prediction and prediction.label==direction else MUTED
+            self.text(LABELS[direction],940,y,14,color)
+            pygame.draw.rect(self.canvas,(39,49,47),(1013,y+7,148,6))
+            width=round(148*probabilities[index])
             if width:
-                pygame.draw.rect(self.canvas,color,(1007,y+7,width,7),border_radius=3)
-            self.text(f"{probabilities[index]*100:.0f}%",1228,y,14,color,mono=True,anchor="topright")
-        pygame.draw.line(self.canvas,LINE,(940,512),(1228,512))
-        self.text("本轮反制",940,529,14,MUTED)
-        direction=LABELS.get(world.strategy_direction,"准备中")
-        prefix="预判 " if getattr(world,"using_prediction",False) else "规则 "
-        self.text(prefix+direction if world.strategy_direction else direction,1228,527,16,PURPLE,anchor="topright")
-        self.text("上轮响应",940,566,14,MUTED)
+                pygame.draw.rect(self.canvas,color,(1013,y+7,width,6))
+            self.text(f"{probabilities[index]*100:.0f}%",1228,y,13,color,mono=True,anchor="topright")
+        pygame.draw.line(self.canvas,LINE,(940,526),(1228,526))
+        self.text("追击实际命中",940,549,14,MUTED)
+        self.text(f"{world.counter_hits} / {world.counter_attempts}",1228,545,20,PURPLE,mono=True,anchor="topright")
+        self.text("上轮走位",940,585,13,MUTED)
         if world.last_response:
-            result="命中" if world.last_prediction_hit else "未猜中"
-            self.text(f"{LABELS[world.last_response]} · {result}",1228,564,15,WHITE,anchor="topright")
+            result="猜中" if world.last_prediction_hit else "落空"
+            self.text(f"{LABELS[world.last_response]} · {result}",1228,583,14,WHITE,anchor="topright")
         else:
-            self.text("等待第一轮结束",1228,565,14,MUTED,anchor="topright")
-        history = model.history[-8:]
-        for index,direction in enumerate(history):
-            box=pygame.Rect(940+index*36,605,29,29)
-            pygame.draw.rect(self.canvas,(29,44,55),box,border_radius=5)
-            self.text(ARROWS[direction],box.centerx,box.centery,21,GREEN if direction!="none" else MUTED,anchor="center")
-        if not history:
-            self.text("历史响应会出现在这里",940,610,13,MUTED)
-        self.text("先判断，再记录你的真实选择。",940,659,13,MUTED)
+            self.text("等待观察",1228,583,14,MUTED,anchor="topright")
+        for index,direction in enumerate(model.history[-8:]):
+            box=pygame.Rect(940+index*36,623,29,29)
+            pygame.draw.rect(self.canvas,(33,43,40),box,border_radius=3)
+            self.text(ARROWS[direction],box.centerx,box.centery,14,GREEN if direction!="stay" else MUTED,anchor="center")
+        if self.toast_timer > 0:
+            self.text(self.toast,940,678,14,MUTED)
+        self.text("ADAPTIVE" if self.mode=="adaptive" else "FIXED",940,737,12,GREEN if self.mode=="adaptive" else BLUE,mono=True)
+        self.text("记录异常" if self.log_warning else "记录中" if self.record else "演练",1228,737,12,
+                  AMBER if self.log_warning else MUTED,anchor="topright")
 
     def _game(self) -> None:
         self.text("别让 AI 学会你",28,23,28,WHITE,True)
-        self.text("ADAPTIVE ARENA",300,34,13,GREEN,mono=True)
+        self.text("交锋 / V0.2",300,34,13,MUTED)
         minutes,seconds=divmod(int(self.world.time),60)
         self.text(f"{minutes:02d}:{seconds:02d}",720,29,24,MUTED,mono=True)
         self.button((850,22,158,35),"C  换对手重开","switch",size=13)
         self.button((1020,22,105,35),"M  声音开" if self.sound.enabled else "M  声音关","sound",size=13)
         self.button((1137,22,115,35),"ESC  暂停","pause",size=13)
         pygame.draw.line(self.canvas,LINE,(28,73),(1252,73))
-        self._meter(28,"你的生命",self.world.player.hp,self.world.player.max_hp,GREEN,242)
-        self._meter(310,"观察者",self.world.boss.hp,self.world.boss.max_hp,RED,338)
-        ready=self.world.player.dash_cooldown<=0
-        self.text("闪避就绪" if ready else f"冷却 {self.world.player.dash_cooldown:.1f}s",690,92,15,GREEN if ready else MUTED)
-        self.text("SPACE",888,94,13,MUTED,mono=True,anchor="topright")
-        pygame.draw.rect(self.canvas,(29,42,55),(690,122,198,8),border_radius=4)
-        width=round(198*(1-ratio(self.world.player.dash_cooldown,DASH_COOLDOWN)))
+        player, boss = self.world.player, self.world.boss
+        self._meter(28,"你的生命",player.hp,player.max_hp,GREEN,242)
+        self._meter(310,"观察者 / 核心暴露" if boss.exposed else "观察者 / 装甲",
+                    boss.hp,boss.max_hp,GREEN if boss.exposed else RED,338)
+        ready=player.dash_cooldown<=0
+        self.text("闪避就绪" if ready else f"冷却 {player.dash_cooldown:.1f}s",690,92,15,GREEN if ready else MUTED)
+        pygame.draw.rect(self.canvas,(39,49,47),(690,122,198,8))
+        width=round(198*(1-ratio(player.dash_cooldown,DASH_COOLDOWN)))
         if width:
-            pygame.draw.rect(self.canvas,GREEN if ready else MUTED,(690,122,width,8),border_radius=4)
+            pygame.draw.rect(self.canvas,GREEN if ready else MUTED,(690,122,width,8))
         self._arena()
         self._sidebar()
-        self.panel((28,717,1224,55),PANEL,LINE,10)
-        for x,key,description in [(47,"WASD / ↑↓←→","移动"),(330,"J / Z","持续射击"),(558,"SPACE / K","闪避"),(823,"R","重新挑战")]:
-            self.text(key,x,733,16,GREEN,mono=True)
-            key_width=self.fonts.get(16,mono=True).size(key)[0]
-            self.text(description,x+key_width+15,733,15,MUTED)
-        self.text("记录未保存" if self.log_warning else "本局自动记录" if self.record else "演示验证",1228,735,12,AMBER if self.log_warning else MUTED,anchor="topright")
+        fraction=ratio(player.charge,CHARGE_DURATION)
+        label="蓄能完成" if fraction>=1 else "正在蓄能" if player.charging else "脉冲炮就绪"
+        color=AMBER if player.charging else MUTED
+        self.text(label,28,720,15,color)
+        self.text(f"{fraction*100:.0f}%",362,720,15,color,mono=True,anchor="topright")
+        pygame.draw.rect(self.canvas,LINE,(28,748,334,5))
+        pygame.draw.rect(self.canvas,AMBER,(28,748,round(334*fraction),5))
+        self.text("破绽增伤" if boss.exposed else "装甲减伤",410,720,14,GREEN if boss.exposed else MUTED)
+        self.text(f"第 {self.world.completed_attacks+1:02d} 轮交锋",888,720,15,MUTED,anchor="topright")
+        self.text("OBSERVER / ADAPTIVE COMBAT SYSTEM",410,747,11,MUTED,mono=True)
 
     def _overlay(self) -> None:
         shade=pygame.Surface(SIZE,pygame.SRCALPHA)
         shade.fill((4,9,16,208))
         self.canvas.blit(shade,(0,0))
         self.buttons.clear()
-        self.panel((328,192,624,412),(18,28,41),(57,78,95),20)
+        self.panel((328,192,624,412),PANEL,LINE,8)
         if self.scene=="paused":
             self.text("稍作休息",640,237,36,WHITE,True,anchor="midtop")
             self.text("游戏和学习记录已暂停",640,298,18,MUTED,anchor="midtop")
             self.button((386,366,508,56),"继续挑战     ENTER","resume",primary=True,size=20)
             self.button((386,438,245,48),"重新开始  R","start")
             self.button((649,438,245,48),"返回主菜单  ESC","menu")
-            self.text("切换窗口时会自动暂停",640,538,14,MUTED,anchor="midtop")
+            self.text("交锋暂停",640,538,14,MUTED,anchor="midtop")
         else:
             won=self.world.result=="win"
             self.text("你赢下了这场交锋" if won else "再试一种打法",640,231,32,GREEN if won else RED,True,anchor="midtop")
             self.text("观察者已被击败" if won else "观察者还记得你刚才的习惯",640,284,17,MUTED,anchor="midtop")
             model=self.world.predictor
-            stats=[("对战用时",f"{self.world.time:.1f}s"),("记录响应",str(model.samples)),("对手命中",f"{model.correct}/{model.samples}")]
+            stats=[("对战用时",f"{self.world.time:.1f}s"),("走位猜中",f"{model.correct}/{model.samples}"),
+                   ("追击打中",f"{self.world.counter_hits}/{self.world.counter_attempts}")]
             for index,(label,value) in enumerate(stats):
                 x=433+index*207
                 self.text(value,x,331,29,WHITE,mono=True,anchor="midtop")
@@ -608,7 +651,7 @@ class GameApp:
             self.button((386,424,508,55),"再来一局     ENTER","start",primary=True,size=20)
             self.button((386,496,245,44),"返回主菜单","menu")
             self.button((649,496,245,44),"换对手并重开  C","switch",size=15)
-            self.text("重新开始会清空本局模型，保留对局记录。",640,560,13,MUTED,anchor="midtop")
+            self.text("SESSION COMPLETE",640,560,12,MUTED,mono=True,anchor="midtop")
 
     def render(self) -> pygame.Surface:
         self.canvas.fill(BG)
@@ -658,17 +701,20 @@ class GameApp:
                 if not smoke_test or frame%6==0 or self.world.result:
                     self.render()
                     self.present()
-                if smoke_test and screenshot and not screenshot_saved and self.world.predictor.samples>=9 and self.world.phase=="windup" and self.world.phase_remaining<0.65:
+                if smoke_test and screenshot and not screenshot_saved and self.world.predictor.samples>=3 and self.world.phase=="lock" and self.world.phase_remaining<0.60:
                     self.render()
                     self.save_screenshot(screenshot)
                     screenshot_saved=True
-                if smoke_test and (frame>=2400 or self.world.result):
+                if smoke_test and (frame>=pilot.MAX_SECONDS*60 or self.world.result):
                     break
             if screenshot and not screenshot_saved:
                 self.render()
                 self.save_screenshot(screenshot)
             if smoke_test:
-                print(f"Smoke test OK: mode={self.mode}, simulated_seconds={self.world.time:.2f}, samples={self.world.predictor.samples}, scene={self.scene}, hp={self.world.player.hp}")
+                complete = self.world.result is not None
+                print(f"Smoke test {'OK' if complete else 'INCOMPLETE'}: mode={self.mode}, simulated_seconds={self.world.time:.2f}, samples={self.world.predictor.samples}, result={self.world.result}, hp={self.world.player.hp}")
+                if not complete:
+                    return 1
             return 0
         finally:
             self.close()

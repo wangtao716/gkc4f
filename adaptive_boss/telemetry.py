@@ -14,7 +14,10 @@ from pathlib import Path
 from uuid import uuid4
 
 
-_RECORDED_EVENTS = frozenset(("decision", "observation", "end"))
+_RECORDED_EVENTS = frozenset((
+    "decision", "observation", "attack", "dash", "phase",
+    "player_hit", "boss_hit", "end",
+))
 
 
 def _utc_now() -> datetime:
@@ -50,7 +53,7 @@ class SessionRecorder:
         try:
             self._write({
                 "type": "session_start",
-                "schema_version": 1,
+                "schema_version": 2,
                 "mode": mode,
                 "seed": seed,
                 "input_source": input_source,
@@ -68,7 +71,7 @@ class SessionRecorder:
         self._stream.flush()
 
     def record(self, event: dict) -> None:
-        """Persist a decision, observation, or match end; ignore other events."""
+        """Persist learning and combat outcomes; ignore non-game events."""
         if event.get("type") not in _RECORDED_EVENTS:
             return
         if self._closed:

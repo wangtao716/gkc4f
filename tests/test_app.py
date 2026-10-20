@@ -8,7 +8,7 @@ import pygame
 import pytest
 
 from adaptive_boss.app import GameApp, SIZE
-from adaptive_boss.engine import InputState
+from adaptive_boss.engine import CHARGE_DURATION, InputState
 
 
 @pytest.fixture
@@ -42,6 +42,21 @@ def start(app):
     return controls
 
 
+def advance_until(app, condition, limit=8.0):
+    for _ in range(round(limit * 60)):
+        if condition():
+            return
+        app.update(1 / 60)
+    assert condition(), "The expected combat event did not occur"
+
+
+def finish_with_charged_shot(app):
+    app.world.boss.hp = 7
+    app.update(CHARGE_DURATION, InputState(attack=True))
+    app.update(1 / 60, InputState(attack=False))
+    advance_until(app, lambda: app.world.result is not None)
+
+
 def test_enter_starts_a_fresh_match_without_logs_or_sound(app):
     assert app.scene == "menu"
     assert app.recorder is None
@@ -56,7 +71,7 @@ def test_enter_starts_a_fresh_match_without_logs_or_sound(app):
 
 def test_pause_freezes_combat_and_learning_then_resume_advances(app):
     start(app)
-    app.update(2.5)
+    advance_until(app, lambda: app.world.predictor.samples >= 1)
     assert app.world.predictor.samples == 1
     press(app, pygame.K_ESCAPE)
     assert app.scene == "paused"
@@ -74,10 +89,15 @@ def test_pause_freezes_combat_and_learning_then_resume_advances(app):
 def test_restart_discards_old_model_state_and_held_keys(app):
     start(app)
     controls = press(app, pygame.K_j)
-    app.update(2.5, controls)
+    app.update(CHARGE_DURATION, controls)
+    assert app.world.boss.hp == app.world.boss.max_hp
+    controls = app.handle_events([keyup(pygame.K_j)])
+    app.update(1 / 60, controls)
+    advance_until(app, lambda: app.world.predictor.samples >= 1)
     assert app.world.predictor.samples == 1
     old_model = app.world.predictor
     assert app.world.boss.hp < app.world.boss.max_hp
+    press(app, pygame.K_j)
     controls = press(app, pygame.K_r)
     assert app.scene == "playing"
     assert app.world.time == 0
@@ -92,7 +112,7 @@ def test_restart_discards_old_model_state_and_held_keys(app):
 
 def test_c_switches_opponent_and_restarts_the_match(app):
     start(app)
-    app.update(2.5)
+    advance_until(app, lambda: app.world.predictor.samples >= 1)
     assert app.mode == "adaptive"
     assert app.world.predictor.samples == 1
     press(app, pygame.K_c)
@@ -110,11 +130,10 @@ def test_c_switches_opponent_and_restarts_the_match(app):
 def test_match_end_displays_results_and_enter_starts_again(app, outcome):
     start(app)
     if outcome == "win":
-        app.world.boss.hp = 7
-        app.update(0.5, InputState(attack=True))
+        finish_with_charged_shot(app)
     else:
         app.world.player.hp = 1
-        app.update(2.1)
+        advance_until(app, lambda: app.world.result is not None)
     assert app.world.result == outcome
     assert app.scene == "result"
     frame = app.render()
@@ -147,8 +166,7 @@ def test_all_four_scenes_render_at_the_logical_resolution(app):
     press(app, pygame.K_ESCAPE)
     capture()
     press(app, pygame.K_RETURN)
-    app.world.boss.hp = 7
-    app.update(0.5, InputState(attack=True))
+    finish_with_charged_shot(app)
     capture()
     assert [scene for scene, _ in scenes] == ["menu", "playing", "paused", "result"]
     assert len({pixels for _, pixels in scenes}) == 4
@@ -161,10 +179,12 @@ def test_letterboxed_resize_preserves_mouse_coordinates_and_button_clicks(app):
     assert app.last_viewport == pygame.Rect(0, 250, 800, 500)
     assert app.mouse_position((400, 500)) == pytest.approx((640, 400))
     assert app.mouse_position((0, 0))[1] < 0
-    # The menu's Start button is at (64, 614, 508, 62) on the logical canvas.
-    # Its scaled center is about (199, 653) in this tall, letterboxed window.
+    start_rect = next(rect for rect, action in app.buttons if action == "start")
+    view = app.last_viewport
+    position = (round(view.x + start_rect.centerx * view.width / SIZE[0]),
+                round(view.y + start_rect.centery * view.height / SIZE[1]))
     app.handle_events([
-        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(199, 653))
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=position)
     ])
     assert app.scene == "playing"
 
@@ -208,3 +228,50 @@ def test_close_releases_pygame_subsystems(app):
     app.close()
     assert not pygame.display.get_init()
     assert not pygame.font.get_init()
+
+
+def test_same_frame_release_and_repress_fires_then_recharges(app):
+    start(app)
+    app.update(CHARGE_DURATION, press(app, pygame.K_j))
+    controls = app.handle_events([keyup(pygame.K_j), keydown(pygame.K_j)])
+    assert controls.attack_edges == (False, True)
+    app.update(1/60, controls)
+    shots = [event for event in app.world.events if event["type"] == "attack"]
+    assert len(shots) == 1
+    assert shots[0]["charge"] == 1
+    assert app.world.player.charging
+    assert app.world.player.charge < 0.1
+    app.update(1/60, app.handle_events([]))
+    assert not any(event["type"] == "attack" for event in app.world.events)
+
+
+def test_same_frame_tap_survives_event_aggregation(app):
+    start(app)
+    controls = app.handle_events([keydown(pygame.K_j), keyup(pygame.K_j)])
+    assert controls.attack_edges == (True, False)
+    app.update(1/60, controls)
+    assert sum(event["type"] == "attack" for event in app.world.events) == 1
+
+
+@pytest.mark.parametrize("interrupt", ["pause", "focus_lost"])
+def test_pause_and_focus_loss_cancel_charge_without_firing_on_resume(app, interrupt):
+    start(app)
+    controls = press(app, pygame.K_j)
+    app.update(CHARGE_DURATION, controls)
+    assert app.world.player.charging
+    assert not app.world.projectiles
+    if interrupt == "pause":
+        press(app, pygame.K_ESCAPE)
+    else:
+        app.headless = False
+        app.handle_events([pygame.event.Event(pygame.WINDOWFOCUSLOST)])
+    assert app.scene == "paused"
+    assert not app.world.player.charging
+    assert app.world.player.charge == 0
+    app.update(1.0, InputState(attack=True))
+    controls = press(app, pygame.K_RETURN)
+    app.update(0.5, controls)
+    assert app.scene == "playing"
+    assert not controls.attack
+    assert not app.world.projectiles
+    assert app.world.boss.hp == app.world.boss.max_hp

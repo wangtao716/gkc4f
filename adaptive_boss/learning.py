@@ -2,7 +2,7 @@
 
 Call ``predict`` when a boss telegraph begins, then pass that *same* immutable
 snapshot to ``observe`` when the response window closes.  A response must be a
-real recorded player action (or ``none``), never the model's own prediction.
+real recorded movement (or ``stay``), never the model's own prediction.
 This keeps evaluation and training causal: the answer is not a feature.
 """
 
@@ -17,10 +17,13 @@ import numpy as np
 from sklearn.linear_model import SGDClassifier
 
 
-DIRECTIONS = ("up", "down", "left", "right", "none")
-_CONTEXT_SIZE = 6
+DIRECTIONS = ("cw", "ccw", "in", "out", "stay")
+CONTEXT_SIZE = 6
 _HISTORY_SIZE = 3
-_FEATURE_SIZE = _CONTEXT_SIZE + _HISTORY_SIZE * len(DIRECTIONS)
+_FEATURE_SIZE = CONTEXT_SIZE + _HISTORY_SIZE * len(DIRECTIONS)
+_RECENCY_DECAY = 0.72
+_PRIOR_SMOOTHING = 0.15
+_RECENT_WEIGHT = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,26 +40,32 @@ class PredictionSnapshot:
 
 
 class BehaviorPredictor:
-    """Incrementally learn real dodge responses with logistic regression.
+    """Learn boss-relative movement from recent responses and online SGD.
 
     ``context`` contains normalized player x/y, player-minus-boss x/y,
     distance divided by arena diagonal, and whether the player attacked
-    recently.  The remaining features are three one-hot encoded *previous*
-    responses, newest first; absent history slots are all zeros.
+    recently or is charging.  The remaining features are three one-hot encoded
+    *previous* responses, newest first; absent history slots are all zeros.
 
-    Every observed event contributes one SGD update, with a constant learning
-    rate so new behavior can replace an old habit.  During the first
-    ``min_samples`` observations the displayed probabilities use Laplace
-    smoothing.  Afterwards they come from the learned model, with a small
-    probability floor to avoid presenting absolute certainty.
+    Responses are clockwise/counterclockwise around the boss, toward/away
+    from the boss, or stationary.  The engine measures actual displacement
+    across a response window, including ordinary movement and successful
+    dashes.  This learner never infers a label from input buttons.
+
+    Each observation decays older response counts by 0.72 and adds one SGD
+    update with a constant learning rate.  Smoothed recent frequencies carry
+    75% of a ready prediction; the context/history model carries the rest.
+    Three observations enable adaptation by default, while a new habit can
+    outweigh even a long prior habit after a few completed response windows.
+    Lifetime counts remain intact as an explicitly slower majority baseline.
 
     ``correct`` and ``baseline_correct`` cover every response, including
-    ``none``.  ``direction_samples`` and ``direction_correct`` cover only
-    actual dodges.  ``recent_accuracy`` covers the latest 20 responses.
+    ``stay``.  ``direction_samples`` and ``direction_correct`` exclude
+    stationary responses.  ``recent_accuracy`` covers the latest 20 responses.
     These are predictions made *before* their corresponding training update.
     """
 
-    def __init__(self, seed: int = 7, min_samples: int = 8) -> None:
+    def __init__(self, seed: int = 7, min_samples: int = 3) -> None:
         if not isinstance(min_samples, int) or min_samples < 1:
             raise ValueError("min_samples must be a positive integer")
         self.seed = seed
@@ -82,6 +91,7 @@ class BehaviorPredictor:
         self.baseline_correct = 0
         self.history: list[str] = []
         self.counts: dict[str, int] = dict.fromkeys(DIRECTIONS, 0)
+        self._recent_counts: dict[str, float] = dict.fromkeys(DIRECTIONS, 0.0)
         self._recent_outcomes: deque[bool] = deque(maxlen=20)
 
     @property
@@ -92,8 +102,8 @@ class BehaviorPredictor:
 
     def _features(self, context: Sequence[float]) -> tuple[float, ...]:
         values = tuple(float(value) for value in context)
-        if len(values) != _CONTEXT_SIZE:
-            raise ValueError("context must contain exactly 6 numeric values")
+        if len(values) != CONTEXT_SIZE:
+            raise ValueError(f"context must contain exactly {CONTEXT_SIZE} numeric values")
         if not all(isfinite(value) for value in values):
             raise ValueError("context values must be finite")
         previous = list(reversed(self.history[-_HISTORY_SIZE:]))
@@ -105,25 +115,35 @@ class BehaviorPredictor:
         return values + history_features
 
     def _prior(self) -> tuple[float, ...]:
-        denominator = self.samples + len(DIRECTIONS)
-        return tuple((self.counts[direction] + 1) / denominator for direction in DIRECTIONS)
+        if not self.samples:
+            return (1.0 / len(DIRECTIONS),) * len(DIRECTIONS)
+        denominator = sum(self._recent_counts.values()) + _PRIOR_SMOOTHING * len(DIRECTIONS)
+        return tuple(
+            (self._recent_counts[direction] + _PRIOR_SMOOTHING) / denominator
+            for direction in DIRECTIONS
+        )
 
     def predict(self, context: Sequence[float]) -> PredictionSnapshot:
         """Freeze a prediction without training or changing any player state."""
         features = self._features(context)
         ready = self.samples >= self.min_samples
         baseline_label = max(DIRECTIONS, key=self.counts.__getitem__)
+        prior = self._prior()
         if not ready:
-            probabilities = self._prior()
+            probabilities = prior
         else:
             raw = self._model.predict_proba(np.asarray([features], dtype=np.float64))[0]
             # The estimator's classes are always [0, 1, 2, 3, 4].  An explicit
             # normalization also absorbs insignificant floating-point drift.
             total = float(raw.sum())
             if not np.isfinite(raw).all() or total <= 0:
-                probabilities = self._prior()
+                probabilities = prior
             else:
-                probabilities = tuple(float(value / total * 0.975 + 0.005) for value in raw)
+                probabilities = tuple(
+                    _RECENT_WEIGHT * recent
+                    + (1.0 - _RECENT_WEIGHT) * float(value / total * 0.975 + 0.005)
+                    for recent, value in zip(prior, raw)
+                )
         best = max(range(len(DIRECTIONS)), key=probabilities.__getitem__)
         return PredictionSnapshot(
             features=features,
@@ -159,7 +179,7 @@ class BehaviorPredictor:
         self.correct += int(was_correct)
         self.baseline_correct += int(snapshot.baseline_label == actual)
         self._recent_outcomes.append(was_correct)
-        if actual != "none":
+        if actual != "stay":
             self.direction_samples += 1
             self.direction_correct += int(was_correct)
 
@@ -171,4 +191,7 @@ class BehaviorPredictor:
 
         self.samples += 1
         self.counts[actual] += 1
+        for direction in DIRECTIONS:
+            self._recent_counts[direction] *= _RECENCY_DECAY
+        self._recent_counts[actual] += 1.0
         self.history.append(actual)

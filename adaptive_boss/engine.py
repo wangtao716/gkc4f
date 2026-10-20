@@ -1,57 +1,61 @@
-"""Deterministic, renderer-independent combat simulation.
+"""Readable, deterministic boss combat with causal movement predictions.
 
-The boss freezes its geometry and its prediction at the start of a telegraph.
-Only the first *successful* dash in that attack's response window is a label;
-walking and a dash rejected by its cooldown do not manufacture training data.
-The fixed and adaptive modes share damage, timing, and attack geometry, except
-for the direction of one counter circle.  No input device is required here.
+Tactics are committed before a response. The aiming marker visibly follows
+the player, then locks every hazard into its predetermined plan. Walking and
+dashing contribute actual displacement; drawing and damage share geometry.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import atan2, cos, hypot, isfinite, pi, sin
 from random import Random
 
 from .learning import BehaviorPredictor, DIRECTIONS, PredictionSnapshot
 
-
 FIXED_STEP = 1.0 / 120.0
 MOVE_SPEED = 190.0
+CHARGE_MOVE_MULTIPLIER = 0.70
 DASH_SPEED = 630.0
 DASH_DURATION = 0.18
 DASH_COOLDOWN = 1.10
-SHOT_INTERVAL = 0.30
-SHOT_DAMAGE = 7
-PROJECTILE_SPEED = 650.0
+CHARGE_DURATION = 0.90
+SHOT_INTERVAL = 0.18
+SHOT_DAMAGE = 8
+FULL_CHARGE_DAMAGE = 42
+PROJECTILE_SPEED = 740.0
 PLAYER_HIT_DAMAGE = 16
 HIT_INVULNERABILITY = 0.75
-WINDUP_DURATION = 1.0
-ACTIVE_DURATION = 0.35
-RECOVERY_DURATION = 0.65
-IDLE_DURATION = 0.75
+AIM_DURATION = 0.80
+LOCK_DURATION = 0.70
+WINDUP_DURATION = AIM_DURATION + LOCK_DURATION
+ACTIVE_DURATION = 0.28
+SWEEP_DURATION = 1.05
+FOLLOWUP_WARNING_DURATION = 0.55
+FOLLOWUP_ACTIVE_DURATION = 0.28
+RECOVERY_DURATION = 1.40
+IDLE_DURATION = 0.55
+SWEEP_ARC = 1.20
+ARMOR_MULTIPLIER = 0.28
+EXPOSED_MULTIPLIER = 1.65
 
-_VECTORS = {
-    "up": (0.0, -1.0),
-    "down": (0.0, 1.0),
-    "left": (-1.0, 0.0),
-    "right": (1.0, 0.0),
-    "none": (0.0, 0.0),
-}
+_VECTORS = {"up": (0.0, -1.0), "down": (0.0, 1.0),
+            "left": (-1.0, 0.0), "right": (1.0, 0.0)}
 
 
 @dataclass(slots=True)
 class InputState:
-    """Normalized movement, held attack, and a dash button state.
+    """Movement, final held buttons, and optional ordered attack transitions.
 
-    Keyboard adapters usually send a one-frame dash pulse.  Held dash is also
-    accepted: the engine starts it only on a rising edge, never automatically.
+    Adapters can preserve multiple press/release events from one display frame
+    in attack_edges. Without them, the engine derives edges from held attack.
     """
 
     move_x: float = 0.0
     move_y: float = 0.0
     attack: bool = False
     dash: bool = False
+    attack_edges: tuple[bool, ...] = ()
 
 
 @dataclass(slots=True)
@@ -66,6 +70,8 @@ class Player:
     facing: tuple[float, float] = (0.0, -1.0)
     invulnerability: float = 0.0
     attack_cooldown: float = 0.0
+    charge: float = 0.0
+    charging: bool = False
 
 
 @dataclass(slots=True)
@@ -73,8 +79,10 @@ class Boss:
     x: float
     y: float
     radius: float = 34.0
-    hp: int = 1600
-    max_hp: int = 1600
+    hp: int = 2400
+    max_hp: int = 2400
+    exposed: bool = False
+    facing: float = pi / 2.0
 
 
 @dataclass(slots=True)
@@ -86,16 +94,15 @@ class Projectile:
     radius: float = 4.0
     damage: int = SHOT_DAMAGE
     lifetime: float = 2.4
+    charge: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class Hazard:
-    """A circle or a capsule, in the same world coordinates as actors.
+    """Circle or capsule in world coordinates; only active hazards do damage.
 
-    ``beam`` is the line segment from (x, y) to (x + cos(angle) * length,
-    y + sin(angle) * length), thickened by ``width / 2`` at every point,
-    including round end caps.  ``angle`` is in radians.  The renderer must use
-    these exact values for both the warning and the live attack.
+    A beam has round end caps of radius width / 2. Progress belongs to its
+    current warning or live stage; sweep_end_angle is the committed endpoint.
     """
 
     kind: str
@@ -106,11 +113,14 @@ class Hazard:
     angle: float = 0.0
     length: float = 0.0
     is_counter: bool = False
+    active: bool = False
+    progress: float = 0.0
+    hazard_id: str = ""
+    attack_id: int = 0
+    sweep_end_angle: float | None = None
 
 
-def _point_segment_distance_sq(
-    px: float, py: float, ax: float, ay: float, bx: float, by: float
-) -> float:
+def _point_segment_distance_sq(px, py, ax, ay, bx, by) -> float:
     dx, dy = bx - ax, by - ay
     denominator = dx * dx + dy * dy
     if denominator <= 1e-18:
@@ -119,67 +129,74 @@ def _point_segment_distance_sq(
     return (px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2
 
 
-def _segment_distance_sq(
-    ax: float, ay: float, bx: float, by: float,
-    cx: float, cy: float, dx: float, dy: float,
-) -> float:
+def _segment_distance_sq(ax, ay, bx, by, cx, cy, dx, dy) -> float:
     """Squared distance between two segments, including crossing segments."""
     cross_a = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
     cross_b = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
     cross_c = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
     cross_d = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
-    boxes_overlap = (
-        max(ax, bx) >= min(cx, dx) and max(cx, dx) >= min(ax, bx)
-        and max(ay, by) >= min(cy, dy) and max(cy, dy) >= min(ay, by)
-    )
+    boxes_overlap = (max(ax, bx) >= min(cx, dx) and max(cx, dx) >= min(ax, bx)
+                     and max(ay, by) >= min(cy, dy) and max(cy, dy) >= min(ay, by))
     if boxes_overlap and cross_a * cross_b <= 0 and cross_c * cross_d <= 0:
         return 0.0
-    return min(
-        _point_segment_distance_sq(ax, ay, cx, cy, dx, dy),
-        _point_segment_distance_sq(bx, by, cx, cy, dx, dy),
-        _point_segment_distance_sq(cx, cy, ax, ay, bx, by),
-        _point_segment_distance_sq(dx, dy, ax, ay, bx, by),
-    )
+    return min(_point_segment_distance_sq(ax, ay, cx, cy, dx, dy),
+               _point_segment_distance_sq(bx, by, cx, cy, dx, dy),
+               _point_segment_distance_sq(cx, cy, ax, ay, bx, by),
+               _point_segment_distance_sq(dx, dy, ax, ay, bx, by))
 
 
-def hazard_hits(
-    hazard: Hazard, x: float, y: float, radius: float,
-    previous: tuple[float, float] | None = None,
-) -> bool:
-    """Intersect a player's swept circle with the rendered hazard geometry."""
+def hazard_hits(hazard: Hazard, x: float, y: float, radius: float,
+                previous: tuple[float, float] | None = None,
+                previous_hazard: Hazard | None = None) -> bool:
+    """Intersect visible geometry, optionally swept over one physics step."""
     px, py = previous if previous is not None else (x, y)
     if hazard.kind == "circle":
         return _point_segment_distance_sq(hazard.x, hazard.y, px, py, x, y) <= (
-            radius + hazard.radius
-        ) ** 2
+            radius + hazard.radius) ** 2
     if hazard.kind == "beam":
         end_x = hazard.x + cos(hazard.angle) * hazard.length
         end_y = hazard.y + sin(hazard.angle) * hazard.length
-        return _segment_distance_sq(px, py, x, y, hazard.x, hazard.y, end_x, end_y) <= (
-            radius + hazard.width / 2.0
-        ) ** 2
+        hit = _segment_distance_sq(px, py, x, y, hazard.x, hazard.y, end_x, end_y) <= (
+            radius + hazard.width / 2.0) ** 2
+        if hit or previous_hazard is None:
+            return hit
+        old = previous_hazard
+        if (old.kind != "beam" or (old.x, old.y, old.length, old.width) !=
+                (hazard.x, hazard.y, hazard.length, hazard.width)):
+            return False
+        if hazard_hits(old, x, y, radius, previous):
+            return True
+        angle_delta = hazard.angle - old.angle
+        if abs(angle_delta) <= 1e-12:
+            return False
+        # The two boundary capsules cover crossings of the angular edges.
+        # Endpoints and the segment's nearest radial point cover the swept
+        # sector interior, including a fast beam crossing a stationary player.
+        dx, dy = x - px, y - py
+        denominator = dx * dx + dy * dy
+        t = max(0.0, min(1.0, ((hazard.x - px) * dx + (hazard.y - py) * dy) / denominator)) if denominator else 0.0
+        for point_x, point_y in ((px, py), (x, y), (px + t * dx, py + t * dy)):
+            angle = atan2(point_y - hazard.y, point_x - hazard.x)
+            travel = ((angle - old.angle) if angle_delta > 0 else (old.angle - angle)) % (2 * pi)
+            if travel <= abs(angle_delta) + 1e-12 and hypot(point_x - hazard.x, point_y - hazard.y) <= (
+                    hazard.length + hazard.width / 2.0 + radius):
+                return True
+        return False
     raise ValueError(f"Unknown hazard kind: {hazard.kind!r}")
 
 
 class World:
-    """One match.  Use ``update`` for simulation and read dataclasses to draw.
+    """One match. Each completed attack observes one actual movement response.
 
-    ``events`` contains JSON-serializable dictionaries from the latest update
-    only.  A completed response window emits exactly one ``observation``.
-    Unfinished windows at match end are discarded instead of being trained as
-    premature ``none`` labels.  ``reset`` starts a fresh model and a fresh match.
+    Events belong to the latest update. Unfinished windows at match end are
+    discarded; reset clears the match and model. Physics runs at fixed 120 Hz.
     """
 
-    def __init__(
-        self, mode: str = "adaptive", seed: int = 7,
-        width: float = 860, height: float = 540,
-    ) -> None:
+    def __init__(self, mode="adaptive", seed=7, width=860, height=540) -> None:
         if not isfinite(width) or not isfinite(height) or width < 360 or height < 300:
             raise ValueError("Arena dimensions must be finite and at least 360 by 300")
-        self.width = float(width)
-        self.height = float(height)
-        self.seed = seed
-        self.mode = mode
+        self.width, self.height = float(width), float(height)
+        self.seed, self.mode = seed, mode
         self.reset()
 
     def reset(self, mode: str | None = None) -> None:
@@ -194,38 +211,60 @@ class World:
         self.projectiles: list[Projectile] = []
         self.hazards: list[Hazard] = []
         self.events: list[dict] = []
-        self.predictor = BehaviorPredictor(seed=self.seed, min_samples=8)
+        self.predictor = BehaviorPredictor(seed=self.seed, min_samples=3)
         self.prediction: PredictionSnapshot | None = None
         self.attack_name = "准备就绪"
+        self.tactic_label = "观察走位"
         self.phase = "idle"
-        self.phase_remaining = 1.0
+        self.phase_duration = 1.0
+        self.phase_remaining = self.phase_duration
         self.completed_attacks = 0
         self.last_response: str | None = None
         self.last_prediction_hit: bool | None = None
         self.strategy_direction: str | None = None
         self.using_prediction = False
+        self.counter_attempts = self.counter_hits = 0
+        self.adaptive_counter_attempts = self.adaptive_counter_hits = 0
         self._rng = Random(self.seed)
         self._accumulator = 0.0
-        self._dash_was_down = False
-        self._pending_dash = False
-        self._pending_dash_vector = (0.0, -1.0)
-        self._dash_vector = (0.0, -1.0)
+        self._dash_was_down = self._pending_dash = False
+        self._pending_dash_vector = self._dash_vector = (0.0, -1.0)
+        self._attack_was_down = self._charge_blocked = False
+        self._pending_attack_edges: list[bool] = []
         self._last_attack_time = -1000.0
         self._pending_snapshot: PredictionSnapshot | None = None
         self._pending_context: tuple[float, ...] | None = None
-        self._response: str | None = None
         self._decision_time: float | None = None
-        self._attacks_started = 0
+        self._response_radial = self._response_tangent = self._response_distance = 0.0
+        self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
+        self._last_movement_direction: str | None = None
+        self._attacks_started = self._attack_index = 0
+        self._has_counter = self._counter_activated = False
+        self._sweep_sign = 1.0
+        self._observed_move_speed = MOVE_SPEED * CHARGE_MOVE_MULTIPLIER
+        self._committed_move_speed = self._observed_move_speed
+        self._locked_main: Hazard | None = None
+        self._locked_counter: Hazard | None = None
 
     def _event(self, event_type: str, **values: object) -> None:
         self.events.append({"type": event_type, "time": round(self.time, 6), **values})
 
-    def update(self, dt: float, controls: InputState) -> None:
-        """Advance all elapsed seconds using fixed 120 Hz physics substeps.
+    def cancel_actions(self) -> None:
+        """Cancel held/buffered actions when pausing, losing focus, or leaving.
 
-        Time is neither tied to display FPS nor silently discarded on a slow
-        frame.  The app should stop calling this method while its menu is open.
+        No release shot is created. Cooldowns and earned damage immunity keep
+        their remaining time, so opening a menu cannot reset combat costs.
         """
+        self.player.charge = 0.0
+        self.player.charging = False
+        self.player.dash_remaining = 0.0
+        self._pending_attack_edges.clear()
+        self._pending_dash = self._dash_was_down = self._attack_was_down = False
+        self._charge_blocked = False
+        self._pending_dash_vector = self.player.facing
+
+    def update(self, dt: float, controls: InputState) -> None:
+        """Advance elapsed time, retaining button edges across short frames."""
         if not isfinite(dt) or dt < 0:
             raise ValueError("dt must be a finite, non-negative number")
         if not isfinite(controls.move_x) or not isfinite(controls.move_y):
@@ -235,15 +274,13 @@ class World:
             return
         if controls.dash and not self._dash_was_down:
             self._pending_dash = True
-            # Preserve the direction at button press even if this display
-            # frame is shorter than one physics step and the keys are released
-            # before the next update.  A buffered dash must not read later keys.
-            self._pending_dash_vector = (
-                (controls.move_x, controls.move_y)
-                if hypot(controls.move_x, controls.move_y) > 1e-6
-                else self.player.facing
-            )
-        self._dash_was_down = controls.dash
+            self._pending_dash_vector = ((controls.move_x, controls.move_y)
+                if hypot(controls.move_x, controls.move_y) > 1e-6 else self.player.facing)
+        if controls.attack_edges:
+            self._pending_attack_edges.extend(bool(pressed) for pressed in controls.attack_edges)
+        elif controls.attack != self._attack_was_down:
+            self._pending_attack_edges.append(bool(controls.attack))
+        self._dash_was_down, self._attack_was_down = controls.dash, controls.attack
         self._accumulator += dt
         while self._accumulator + 1e-12 >= FIXED_STEP and self.result is None:
             self._accumulator = max(0.0, self._accumulator - FIXED_STEP)
@@ -266,64 +303,85 @@ class World:
             self._pending_dash = False
             if player.dash_cooldown <= 1e-10:
                 self._start_dash(*self._pending_dash_vector)
-
+        self._update_charge(dt)
         previous = (player.x, player.y)
         dash_time = min(dt, player.dash_remaining)
         normal_time = dt - dash_time
-        player.x += self._dash_vector[0] * DASH_SPEED * dash_time + move_x * MOVE_SPEED * normal_time
-        player.y += self._dash_vector[1] * DASH_SPEED * dash_time + move_y * MOVE_SPEED * normal_time
+        speed = MOVE_SPEED * (CHARGE_MOVE_MULTIPLIER if player.charging else 1.0)
+        player.x += self._dash_vector[0] * DASH_SPEED * dash_time + move_x * speed * normal_time
+        player.y += self._dash_vector[1] * DASH_SPEED * dash_time + move_y * speed * normal_time
         player.dash_remaining = max(0.0, player.dash_remaining - dt)
         player.x = max(player.radius, min(self.width - player.radius, player.x))
         player.y = max(player.radius, min(self.height - player.radius, player.y))
-
-        if controls.attack and player.attack_cooldown <= 1e-10:
-            self._shoot()
+        self._record_displacement(previous)
         self._update_projectiles(dt)
         if self.boss.hp <= 0:
             self._finish("win")
             return
-        if self.phase == "active" and player.invulnerability <= 1e-10:
-            if any(hazard_hits(h, player.x, player.y, player.radius, previous) for h in self.hazards):
-                player.hp = max(0, player.hp - PLAYER_HIT_DAMAGE)
-                player.invulnerability = HIT_INVULNERABILITY
-                self._event("player_hit", damage=PLAYER_HIT_DAMAGE, hp=player.hp, x=player.x, y=player.y)
+        previous_hazards = {hazard.hazard_id: hazard for hazard in self.hazards if hazard.active}
+        self.phase_remaining = max(0.0, self.phase_remaining - dt)
+        self._sync_hazards()
+        if player.invulnerability <= 1e-10:
+            for hazard in self.hazards:
+                if hazard.active and hazard_hits(hazard, player.x, player.y, player.radius,
+                                                previous, previous_hazards.get(hazard.hazard_id)):
+                    self._damage_player(hazard)
+                    break
         if player.hp <= 0:
             self._finish("lose")
-            return
-        self.phase_remaining = max(0.0, self.phase_remaining - dt)
-        if self.phase_remaining <= 1e-10:
+        elif self.phase_remaining <= 1e-10:
             self._advance_phase()
 
     def _start_dash(self, move_x: float, move_y: float) -> None:
         if hypot(move_x, move_y) <= 1e-6:
             move_x, move_y = self.player.facing
-        if abs(move_x) > abs(move_y):
-            direction = "right" if move_x > 0 else "left"
-        else:
-            direction = "down" if move_y > 0 else "up"
-        self._dash_vector = _VECTORS[direction]
-        self.player.facing = self._dash_vector
+        direction = (("right" if move_x > 0 else "left") if abs(move_x) > abs(move_y)
+                     else ("down" if move_y > 0 else "up"))
+        self._dash_vector = self.player.facing = _VECTORS[direction]
         self.player.dash_cooldown = DASH_COOLDOWN
         self.player.dash_remaining = DASH_DURATION
         self.player.invulnerability = max(self.player.invulnerability, DASH_DURATION)
-        if self._pending_snapshot is not None and self._response is None:
-            self._response = direction
+        self._charge_blocked = self.player.charging or self._attack_was_down
+        self.player.charging = False
+        self.player.charge = 0.0
         self._event("dash", direction=direction, x=self.player.x, y=self.player.y)
 
-    def _shoot(self) -> None:
+    def _update_charge(self, dt: float) -> None:
+        player = self.player
+        for pressed in self._pending_attack_edges:
+            if pressed:
+                if not self._charge_blocked and player.dash_remaining <= 0:
+                    player.charging = True
+                    player.charge = 0.0
+                else:
+                    self._charge_blocked = True
+            else:
+                if player.charging and not self._charge_blocked and player.dash_remaining <= 0:
+                    self._shoot(player.charge)
+                player.charging = False
+                player.charge = 0.0
+                self._charge_blocked = False
+        self._pending_attack_edges.clear()
+        if player.charging:
+            player.charge = min(CHARGE_DURATION, player.charge + dt)
+
+    def _shoot(self, charge: float) -> None:
+        if self.player.attack_cooldown > 1e-10:
+            return
         dx, dy = self.boss.x - self.player.x, self.boss.y - self.player.y
         distance = hypot(dx, dy)
         if distance <= 1e-8:
             dx, dy, distance = 0.0, -1.0, 1.0
         dx, dy = dx / distance, dy / distance
+        fraction = max(0.0, min(1.0, charge / CHARGE_DURATION))
+        damage = round(SHOT_DAMAGE + (FULL_CHARGE_DAMAGE - SHOT_DAMAGE) * fraction ** 1.4)
         self.projectiles.append(Projectile(
-            self.player.x + dx * self.player.radius,
-            self.player.y + dy * self.player.radius,
+            self.player.x + dx * self.player.radius, self.player.y + dy * self.player.radius,
             dx * PROJECTILE_SPEED, dy * PROJECTILE_SPEED,
-        ))
+            radius=4.0 + fraction * 4.0, damage=damage, charge=fraction))
         self.player.attack_cooldown = SHOT_INTERVAL
         self._last_attack_time = self.time
-        self._event("attack", x=self.player.x, y=self.player.y)
+        self._event("attack", x=self.player.x, y=self.player.y, charge=fraction, damage=damage)
 
     def _update_projectiles(self, dt: float) -> None:
         survivors = []
@@ -332,134 +390,239 @@ class World:
             projectile.x += projectile.vx * dt
             projectile.y += projectile.vy * dt
             projectile.lifetime -= dt
-            hit = _point_segment_distance_sq(
-                self.boss.x, self.boss.y, old_x, old_y, projectile.x, projectile.y
-            ) <= (self.boss.radius + projectile.radius) ** 2
+            hit = _point_segment_distance_sq(self.boss.x, self.boss.y, old_x, old_y,
+                projectile.x, projectile.y) <= (self.boss.radius + projectile.radius) ** 2
             if hit:
-                damage = min(projectile.damage, self.boss.hp)
+                multiplier = EXPOSED_MULTIPLIER if self.boss.exposed else ARMOR_MULTIPLIER
+                damage = min(max(1, round(projectile.damage * multiplier)), self.boss.hp)
                 self.boss.hp -= damage
-                self._event("boss_hit", damage=damage, hp=self.boss.hp, x=projectile.x, y=projectile.y)
-            elif (
-                projectile.lifetime > 0 and -30 <= projectile.x <= self.width + 30
-                and -30 <= projectile.y <= self.height + 30
-            ):
+                self._event("boss_hit", damage=damage, hp=self.boss.hp,
+                    x=projectile.x, y=projectile.y, exposed=self.boss.exposed, charge=projectile.charge)
+            elif (projectile.lifetime > 0 and -30 <= projectile.x <= self.width + 30
+                  and -30 <= projectile.y <= self.height + 30):
                 survivors.append(projectile)
         self.projectiles = survivors
+
+    def _damage_player(self, hazard: Hazard) -> None:
+        player = self.player
+        player.hp = max(0, player.hp - PLAYER_HIT_DAMAGE)
+        player.invulnerability = HIT_INVULNERABILITY
+        if hazard.is_counter:
+            self.counter_hits += 1
+            self.adaptive_counter_hits += int(self.using_prediction)
+        self._event("player_hit", damage=PLAYER_HIT_DAMAGE, hp=player.hp, x=player.x, y=player.y,
+            attack_id=hazard.attack_id, attack_number=hazard.attack_id,
+            hazard_id=hazard.hazard_id, is_counter=hazard.is_counter,
+            using_prediction=self.using_prediction, strategy_direction=self.strategy_direction)
+
+    def _set_phase(self, phase: str, duration: float) -> None:
+        self.phase, self.phase_duration, self.phase_remaining = phase, duration, duration
+        self.boss.exposed = phase == "recovery"
+        self._sync_hazards()
+        self._event("phase", phase=phase, duration=duration, attack_id=self._attacks_started)
 
     def _advance_phase(self) -> None:
         if self.phase == "idle":
             self._begin_attack()
-        elif self.phase == "windup":
-            self.phase = "active"
-            self.phase_remaining = ACTIVE_DURATION
+        elif self.phase == "aim":
+            self._lock_attack()
+            self._set_phase("lock", LOCK_DURATION)
+        elif self.phase == "lock":
+            self._set_phase("active", ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION)
         elif self.phase == "active":
-            self._complete_observation()
-            self.completed_attacks += 1
-            self.hazards = []
-            self.phase = "recovery"
-            self.phase_remaining = RECOVERY_DURATION
+            if self._has_counter:
+                self._set_phase("followup", FOLLOWUP_WARNING_DURATION + FOLLOWUP_ACTIVE_DURATION)
+            else:
+                self._start_recovery()
+        elif self.phase == "followup":
+            self._start_recovery()
         elif self.phase == "recovery":
-            self.phase = "idle"
-            self.phase_remaining = IDLE_DURATION
+            self._set_phase("idle", IDLE_DURATION)
+
+    def _start_recovery(self) -> None:
+        self._complete_observation()
+        self.completed_attacks += 1
+        self._set_phase("recovery", RECOVERY_DURATION)
 
     def _begin_attack(self) -> None:
         player, boss = self.player, self.boss
-        context = (
-            player.x / self.width, player.y / self.height,
+        context = (player.x / self.width, player.y / self.height,
             (player.x - boss.x) / self.width, (player.y - boss.y) / self.height,
             hypot(player.x - boss.x, player.y - boss.y) / hypot(self.width, self.height),
-            float(self.time - self._last_attack_time <= 0.75),
-        )
+            float(player.charging or self.time - self._last_attack_time <= 0.75))
         snapshot = self.predictor.predict(context)
-        # Draw the same random fallback in both modes, even after the adaptive
-        # model becomes ready.  Randomness and the main attack cycle then remain
-        # identical in seed-matched comparisons; only the counter aim changes.
         fallback = self._rng.choice(DIRECTIONS)
-        self.using_prediction = (
-            self.mode == "adaptive" and snapshot.ready and snapshot.confidence >= 0.38
-        )
+        self.using_prediction = self.mode == "adaptive" and snapshot.ready and snapshot.confidence >= 0.38
         direction = snapshot.label if self.using_prediction else fallback
-        self.strategy_direction = direction
-        self.prediction = snapshot
-        self._pending_snapshot = snapshot
-        self._pending_context = context
-        self._response = None
+        self.strategy_direction, self.prediction = direction, snapshot
+        self._pending_snapshot, self._pending_context = snapshot, context
+        self._response_radial = self._response_tangent = self._response_distance = 0.0
+        self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
+        self._last_movement_direction = None
         self._decision_time = self.time
-
-        attack_index = self._attacks_started % 3
+        self._committed_move_speed = self._observed_move_speed
+        self._attack_index = self._attacks_started % 2
+        self._has_counter = self._attacks_started % 3 != 0
+        self._sweep_sign = -1.0 if direction == "ccw" else 1.0
+        if direction not in ("cw", "ccw"):
+            self._sweep_sign = -1.0 if (self._attacks_started // 2) % 2 else 1.0
         self._attacks_started += 1
-        aim_angle = atan2(player.y - boss.y, player.x - boss.x)
-        if attack_index == 0:
-            self.attack_name = "锁定轰击"
-            hazards = [Hazard("circle", player.x, player.y, radius=62.0)]
-        elif attack_index == 1:
-            self.attack_name = "定向光束"
-            hazards = [Hazard(
-                "beam", boss.x, boss.y, width=44.0,
-                angle=aim_angle, length=hypot(self.width, self.height),
-            )]
-        else:
-            self.attack_name = "交叉封锁"
-            half_length = hypot(self.width, self.height) * 0.60
-            hazards = [
-                Hazard(
-                    "beam", player.x - cos(angle) * half_length,
-                    player.y - sin(angle) * half_length,
-                    width=28.0, angle=angle, length=half_length * 2,
-                )
-                for angle in (aim_angle + pi / 4.0, aim_angle - pi / 4.0)
-            ]
-        dx, dy = _VECTORS[direction]
-        landing_x = max(player.radius, min(self.width - player.radius, player.x + dx * DASH_SPEED * DASH_DURATION))
-        landing_y = max(player.radius, min(self.height - player.radius, player.y + dy * DASH_SPEED * DASH_DURATION))
-        hazards.append(Hazard("circle", landing_x, landing_y, radius=48.0, is_counter=True))
-        self.hazards = hazards
-        self.phase = "windup"
-        self.phase_remaining = WINDUP_DURATION
-        self._event(
-            "decision", mode=self.mode, attack=self.attack_name, context=list(context),
+        self._locked_main = self._locked_counter = None
+        self._counter_activated = False
+        self.attack_name = "定点轰击" if self._attack_index == 0 else "动态横扫"
+        self.tactic_label = {"cw": "顺时针侧封", "ccw": "逆时针侧封", "in": "近身封锁",
+                             "out": "外沿拦截", "stay": "原点追击"}[direction]
+        if self._attack_index == 1:
+            self.tactic_label = "顺时针横扫" if self._sweep_sign > 0 else "逆时针横扫"
+        self._event("decision", mode=self.mode, attack=self.attack_name, context=list(context),
             prediction=snapshot.label, probabilities=dict(zip(DIRECTIONS, snapshot.probabilities)),
-            samples=snapshot.samples, ready=snapshot.ready,
+            confidence=snapshot.confidence, samples=snapshot.samples, ready=snapshot.ready,
             strategy_direction=direction, using_prediction=self.using_prediction,
-            attack_number=self._attacks_started,
-        )
+            attack_number=self._attacks_started, attack_id=self._attacks_started,
+            has_counter=self._has_counter, tactic_label=self.tactic_label,
+            movement_speed_estimate=round(self._committed_move_speed, 3),
+            movement_speed_source="previous_completed_response" if self.completed_attacks else "initial_default",
+            counter_lead_time=LOCK_DURATION + FOLLOWUP_WARNING_DURATION + (
+                ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION))
+        self._set_phase("aim", AIM_DURATION)
+
+    def _main_geometry(self, target_x: float, target_y: float) -> Hazard:
+        common = {"hazard_id": f"{self._attacks_started}:main", "attack_id": self._attacks_started}
+        if self._attack_index == 0:
+            return Hazard("circle", target_x, target_y, radius=60.0, **common)
+        center = atan2(target_y - self.boss.y, target_x - self.boss.x)
+        start = center
+        return Hazard("beam", self.boss.x, self.boss.y, width=34.0,
+            angle=start, length=hypot(self.width, self.height),
+            sweep_end_angle=start + self._sweep_sign * SWEEP_ARC, **common)
+
+    def _lock_attack(self) -> None:
+        player, boss = self.player, self.boss
+        self._locked_main = self._main_geometry(player.x, player.y)
+        dx, dy = player.x - boss.x, player.y - boss.y
+        distance = hypot(dx, dy)
+        rx, ry = (dx / distance, dy / distance) if distance > 1e-8 else (0.0, 1.0)
+        lead_time = LOCK_DURATION + FOLLOWUP_WARNING_DURATION + (
+            ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION)
+        travel = self._committed_move_speed * lead_time
+        if self.strategy_direction in ("cw", "ccw"):
+            sign = 1.0 if self.strategy_direction == "cw" else -1.0
+            angle = atan2(ry, rx) + sign * min(1.8, travel / max(distance, 40.0))
+            target_x, target_y = boss.x + cos(angle) * distance, boss.y + sin(angle) * distance
+        else:
+            sign = {"in": -1.0, "out": 1.0, "stay": 0.0}[self.strategy_direction]
+            target_radius = max(0.0, distance + sign * travel)
+            target_x, target_y = boss.x + rx * target_radius, boss.y + ry * target_radius
+        target_x = max(player.radius, min(self.width - player.radius, target_x))
+        target_y = max(player.radius, min(self.height - player.radius, target_y))
+        common = {"is_counter": True, "hazard_id": f"{self._attacks_started}:counter",
+                  "attack_id": self._attacks_started}
+        if self._has_counter:
+            if self._attack_index == 0:
+                self._locked_counter = Hazard("circle", target_x, target_y, radius=44.0, **common)
+            else:
+                self._locked_counter = Hazard("beam", boss.x, boss.y, width=30.0,
+                    angle=atan2(target_y - boss.y, target_x - boss.x),
+                    length=hypot(self.width, self.height), **common)
+        self.boss.facing = atan2(player.y - boss.y, player.x - boss.x)
+
+    def _sync_hazards(self) -> None:
+        elapsed = max(0.0, self.phase_duration - self.phase_remaining)
+        progress = min(1.0, elapsed / self.phase_duration) if self.phase_duration else 1.0
+        if self.phase == "aim":
+            self.hazards = [replace(self._main_geometry(self.player.x, self.player.y), progress=progress)]
+            self.boss.facing = atan2(self.player.y - self.boss.y, self.player.x - self.boss.x)
+        elif self.phase == "lock" and self._locked_main is not None:
+            self.hazards = [replace(self._locked_main, progress=progress)]
+        elif self.phase == "active" and self._locked_main is not None:
+            hazard = self._locked_main
+            if hazard.sweep_end_angle is not None:
+                angle = hazard.angle + (hazard.sweep_end_angle - hazard.angle) * progress
+                hazard = replace(hazard, angle=angle)
+                self.boss.facing = angle
+            self.hazards = [replace(hazard, active=True, progress=progress)]
+        elif self.phase == "followup" and self._locked_counter is not None:
+            active = elapsed + 1e-10 >= FOLLOWUP_WARNING_DURATION
+            stage_progress = ((elapsed - FOLLOWUP_WARNING_DURATION) / FOLLOWUP_ACTIVE_DURATION
+                              if active else elapsed / FOLLOWUP_WARNING_DURATION)
+            self.hazards = [replace(self._locked_counter, active=active,
+                                    progress=max(0.0, min(1.0, stage_progress)))]
+            if active and not self._counter_activated:
+                self._counter_activated = True
+                self.counter_attempts += 1
+                self.adaptive_counter_attempts += int(self.using_prediction)
+            if self._locked_counter.kind == "beam":
+                self.boss.facing = self._locked_counter.angle
+        elif self.phase in ("idle", "recovery"):
+            self.hazards = []
+
+    def _record_displacement(self, previous: tuple[float, float]) -> None:
+        if self._pending_snapshot is None:
+            return
+        dx, dy = self.player.x - previous[0], self.player.y - previous[1]
+        distance = hypot(dx, dy)
+        if distance <= 1e-10:
+            return
+        # A midpoint polar basis avoids radial bias when orbiting the boss.
+        rx = (previous[0] + self.player.x) * 0.5 - self.boss.x
+        ry = (previous[1] + self.player.y) * 0.5 - self.boss.y
+        radial_distance = hypot(rx, ry)
+        if radial_distance <= 1e-8:
+            rx, ry, radial_distance = 0.0, 1.0, 1.0
+        rx, ry = rx / radial_distance, ry / radial_distance
+        radial, tangent = dx * rx + dy * ry, -dx * ry + dy * rx
+        self._response_radial += radial
+        self._response_tangent += tangent
+        self._response_distance += distance
+        radial_label = "out" if radial > 0 else "in"
+        tangent_label = "cw" if tangent > 0 else "ccw"
+        self._response_travel[radial_label] += abs(radial)
+        self._response_travel[tangent_label] += abs(tangent)
+        self._last_movement_direction = tangent_label if abs(tangent) >= abs(radial) else radial_label
 
     def _complete_observation(self) -> None:
         snapshot = self._pending_snapshot
         if snapshot is None:
             return
-        actual = self._response or "none"
+        radial, tangent = self._response_radial, self._response_tangent
+        if self._response_distance < 18.0:
+            actual = "stay"
+        else:
+            largest = max(self._response_travel.values())
+            tied = [label for label, distance in self._response_travel.items()
+                    if abs(distance - largest) < 1e-8]
+            actual = self._last_movement_direction if self._last_movement_direction in tied else tied[0]
         self.last_response = actual
         self.last_prediction_hit = snapshot.label == actual
         self.predictor.observe(snapshot, actual)
-        self._event(
-            "observation", mode=self.mode, context=list(self._pending_context or ()),
+        self._event("observation", mode=self.mode, context=list(self._pending_context or ()),
             features=list(snapshot.features), prediction=snapshot.label,
             probabilities=dict(zip(DIRECTIONS, snapshot.probabilities)),
-            confidence=snapshot.confidence, actual=actual,
-            correct=self.last_prediction_hit, baseline_prediction=snapshot.baseline_label,
-            baseline_correct=snapshot.baseline_label == actual,
+            confidence=snapshot.confidence, actual=actual, correct=self.last_prediction_hit,
+            baseline_prediction=snapshot.baseline_label, baseline_correct=snapshot.baseline_label == actual,
             samples_before=snapshot.samples, samples_after=self.predictor.samples,
             ready=snapshot.ready, strategy_direction=self.strategy_direction,
-            using_prediction=self.using_prediction,
-            attack=self.attack_name, attack_number=self._attacks_started,
+            using_prediction=self.using_prediction, attack=self.attack_name,
+            attack_number=self._attacks_started, attack_id=self._attacks_started,
             decision_time=round(self._decision_time or 0.0, 6),
-        )
-        self._pending_snapshot = None
-        self._pending_context = None
-        self._response = None
-        self._decision_time = None
+            radial_displacement=round(radial, 3), tangent_displacement=round(tangent, 3),
+            distance_moved=round(self._response_distance, 3),
+            directional_travel={label: round(distance, 3) for label, distance in self._response_travel.items()})
+        response_time = self.time - self._decision_time if self._decision_time is not None else FIXED_STEP
+        self._observed_move_speed = max(60.0, min(MOVE_SPEED,
+            self._response_distance / max(FIXED_STEP, response_time)))
+        self._pending_snapshot = self._pending_context = self._decision_time = None
 
     def _finish(self, result: str) -> None:
         self.result = result
-        self._pending_snapshot = None
-        self._pending_context = None
-        self._response = None
-        self._decision_time = None
+        self._pending_snapshot = self._pending_context = self._decision_time = None
         self._pending_dash = False
+        self._pending_attack_edges.clear()
+        self.player.charging = False
+        self.player.charge = 0.0
         self.hazards = []
-        self._event(
-            "end", result=result, mode=self.mode, player_hp=self.player.hp,
+        self._event("end", result=result, mode=self.mode, player_hp=self.player.hp,
             boss_hp=self.boss.hp, completed_attacks=self.completed_attacks,
-            samples=self.predictor.samples,
-        )
+            samples=self.predictor.samples, counter_attempts=self.counter_attempts,
+            counter_hits=self.counter_hits, adaptive_counter_attempts=self.adaptive_counter_attempts,
+            adaptive_counter_hits=self.adaptive_counter_hits)

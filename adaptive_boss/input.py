@@ -19,7 +19,7 @@ _GAME_KEYS = _LEFT | _RIGHT | _UP | _DOWN | _ATTACK | _DASH
 
 
 class KeyboardInput:
-    """Track held movement/attack and emit one dash pulse per key press.
+    """Track held movement, ordered attack edges, and dash press pulses.
 
     Event-based state also works with synthetic events in a headless run.
     ``reset`` should be called when changing screens or pausing; focus loss
@@ -34,7 +34,9 @@ class KeyboardInput:
 
     def poll(self, events: list[pygame.event.Event]) -> InputState:
         dash_pressed = False
+        attack_edges: list[bool] = []
         for event in events:
+            attack_before = bool(self._held & _ATTACK)
             lost_focus = event.type == pygame.WINDOWFOCUSLOST
             if event.type == pygame.ACTIVEEVENT:
                 lost_focus = not getattr(event, "gain", 1) and bool(
@@ -43,6 +45,8 @@ class KeyboardInput:
             if lost_focus:
                 self.reset()
                 dash_pressed = False
+                attack_edges.clear()
+                continue
             elif event.type == pygame.KEYUP:
                 self._held.discard(event.key)
             elif event.type == pygame.KEYDOWN and event.key in _GAME_KEYS:
@@ -51,6 +55,9 @@ class KeyboardInput:
                 self._held.add(event.key)
                 if event.key in _DASH:
                     dash_pressed = True
+            attack_after = bool(self._held & _ATTACK)
+            if attack_after != attack_before:
+                attack_edges.append(attack_after)
 
         move_x = float(bool(self._held & _RIGHT)) - float(bool(self._held & _LEFT))
         move_y = float(bool(self._held & _DOWN)) - float(bool(self._held & _UP))
@@ -63,4 +70,5 @@ class KeyboardInput:
             move_y=move_y,
             attack=bool(self._held & _ATTACK),
             dash=dash_pressed,
+            attack_edges=tuple(attack_edges),
         )
