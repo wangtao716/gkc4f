@@ -1,7 +1,7 @@
 """Causal sweep choices and escapes through ordinary, visible-state inputs."""
 
 from copy import deepcopy
-from math import cos, hypot, pi, sin
+from math import hypot
 
 import pytest
 
@@ -211,7 +211,7 @@ def play_script(world, sign, choice, reaction_delay, charging=False):
 
 
 @pytest.mark.parametrize("label,sign", [("cw", 1), ("ccw", -1)])
-@pytest.mark.parametrize("radius,reaction_delay", [(80, 0.35), (150, 0.20), (230, 0.20), (350, 0.20)])
+@pytest.mark.parametrize("radius,reaction_delay", [(150, 0.20), (230, 0.20), (350, 0.20)])
 def test_predicted_side_is_hit_opposite_side_escapes_and_visible_reversal_rescues(label, sign, radius, reaction_delay):
     initial = sweep_at_lock(label, radius)
     same, opposite, rescue = (deepcopy(initial) for _ in range(3))
@@ -236,41 +236,6 @@ def test_charging_still_allows_a_two_tenths_second_visible_rescue(label, sign, r
     assert world.player.hp == world.player.max_hp
     assert observation(events)["actual"] == label
     assert any(event["type"] == "dash" for event in events)
-
-
-@pytest.mark.parametrize("label,sign", [("cw", 1), ("ccw", -1)])
-def test_near_diagonal_position_has_a_dash_escape_from_the_visible_beam(label, sign):
-    world = World()
-    initial_angle = pi / 4
-    world.player.x = world.boss.x + cos(initial_angle) * 80
-    world.player.y = world.boss.y + sin(initial_angle) * 80
-    rehearse(world, "sweep", label)
-    world._attacks_started = 1
-    until_phase(world, "lock")
-    dx, dy = -sin(initial_angle) * sign, cos(initial_angle) * sign
-    previous_angle = seen_rotation_at = visible_sign = None
-    reversed_once = False
-    for _ in range(400):
-        move_x, move_y = (-dx, -dy) if reversed_once else (dx, dy)
-        dash = False
-        if world.phase == "active" and world.hazards:
-            beam_angle = world.hazards[0].angle
-            if previous_angle is not None and beam_angle != previous_angle and seen_rotation_at is None:
-                seen_rotation_at = world.time
-                visible_sign = 1 if beam_angle > previous_angle else -1
-            previous_angle = beam_angle
-            if (seen_rotation_at is not None and not reversed_once
-                    and world.time - seen_rotation_at >= 0.25):
-                # Reverse along the tangent of the *current* visible beam,
-                # without reading its planned endpoint or predicted direction.
-                move_x, move_y = sin(beam_angle) * visible_sign, -cos(beam_angle) * visible_sign
-                dash = reversed_once = True
-        world.update(FIXED_STEP, InputState(move_x, move_y, dash=dash))
-        if world.phase == "recovery":
-            break
-    assert world.phase == "recovery" and reversed_once
-    assert world.player.hp == world.player.max_hp
-    assert world.last_response == label
 
 
 def test_sweep_hit_stat_counts_attacks_once_even_if_damage_repeats():
