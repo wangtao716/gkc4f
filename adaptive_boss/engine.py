@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from math import atan2, cos, hypot, isfinite, pi, sin
 from random import Random
 
-from .learning import BehaviorPredictor, DIRECTIONS, PredictionSnapshot
+from .learning import BehaviorPredictor, DIRECTIONS, EXPERT_NAMES, PredictionSnapshot
 
 FIXED_STEP = 1.0 / 120.0
 MOVE_SPEED = 190.0
@@ -27,11 +27,11 @@ PROJECTILE_SPEED = 740.0
 PLAYER_HIT_DAMAGE = 16
 HIT_INVULNERABILITY = 0.75
 AIM_DURATION = 0.80
-LOCK_DURATION = 0.45
+LOCK_DURATION = 0.55
 WINDUP_DURATION = AIM_DURATION + LOCK_DURATION
 ACTIVE_DURATION = 0.28
 SWEEP_DURATION = 1.00
-FOLLOWUP_WARNING_DURATION = 0.35
+FOLLOWUP_WARNING_DURATION = 0.25
 FOLLOWUP_ACTIVE_DURATION = 0.55
 RECOVERY_DURATION = 1.40
 IDLE_DURATION = 0.55
@@ -42,6 +42,20 @@ BOSS_BODY_RADIUS = 44.0
 ARMOR_CHARGE_THRESHOLD = 0.50
 ARMOR_MULTIPLIER = 0.28
 EXPOSED_MULTIPLIER = 1.65
+
+
+def _prediction_diagnostics(snapshot: PredictionSnapshot, labels: tuple[str, ...]) -> dict:
+    """Serialize only the diagnostic values frozen when this attack locked."""
+    return {
+        "response_history": list(snapshot.response_history),
+        "markov_order": snapshot.markov_order,
+        "expert_weights": dict(zip(EXPERT_NAMES, snapshot.expert_weights)),
+        "expert_probabilities": {
+            name: dict(zip(labels, probabilities))
+            for name, probabilities in zip(EXPERT_NAMES, snapshot.expert_probabilities)
+        },
+    }
+
 
 def _movement_vector(move_x: float, move_y: float) -> tuple[float, float]:
     """Apply the same input bounds and diagonal limit to walking and dashing."""
@@ -560,7 +574,8 @@ class World:
             movement_speed_estimate=round(self._committed_move_speed, 3),
             movement_speed_source="previous_completed_bomb_response" if self.predictors["bomb"].samples else "initial_default",
             counter_lead_time=(LOCK_DURATION + FOLLOWUP_WARNING_DURATION + ACTIVE_DURATION
-                               if self._has_counter else None))
+                               if self._has_counter else None),
+            **_prediction_diagnostics(snapshot, self.predictor.labels))
 
     def _main_geometry(self, target_x: float, target_y: float) -> Hazard:
         common = {"hazard_id": f"{self._attacks_started}:main", "attack_id": self._attacks_started}
@@ -703,7 +718,8 @@ class World:
             decision_time=round(self._decision_time or 0.0, 6),
             radial_displacement=round(radial, 3), tangent_displacement=round(tangent, 3),
             distance_moved=round(self._response_distance, 3),
-            directional_travel={label: round(distance, 3) for label, distance in self._response_travel.items()})
+            directional_travel={label: round(distance, 3) for label, distance in self._response_travel.items()},
+            **_prediction_diagnostics(snapshot, self.predictor.labels))
         response_time = self.time - self._decision_time if self._decision_time is not None else FIXED_STEP
         if self.attack_kind == "bomb":
             self._observed_move_speed = max(60.0, min(MOVE_SPEED,

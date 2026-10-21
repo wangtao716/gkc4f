@@ -16,6 +16,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
 
+from . import __version__
 from .audio import SoundBank
 from .engine import (
     CHARGE_DURATION, DASH_COOLDOWN, FOLLOWUP_ACTIVE_DURATION,
@@ -104,7 +105,7 @@ class GameApp:
         pygame.display.init()
         pygame.font.init()
         self.window = pygame.display.set_mode(SIZE, pygame.RESIZABLE)
-        pygame.display.set_caption("别让 AI 学会你 | 交锋 V0.3")
+        pygame.display.set_caption(f"别让 AI 学会你 | 交锋 V{__version__}")
         icon = pygame.Surface((32, 32), pygame.SRCALPHA)
         pygame.draw.polygon(icon, GREEN, [(16, 2), (29, 16), (16, 30), (3, 16)])
         pygame.draw.circle(icon, BG, (16, 16), 6)
@@ -390,7 +391,7 @@ class GameApp:
     def _menu(self) -> None:
         self._grid(self.canvas, 64, (23, 30, 31))
         self.text("ADAPTIVE ARENA", 64, 46, 17, GREEN, mono=True)
-        self.text("交锋  /  V0.3", 1216, 47, 15, MUTED, anchor="topright")
+        self.text(f"交锋  /  V{__version__}", 1216, 47, 15, MUTED, anchor="topright")
         self.text("别让 AI", 62, 135, 66, WHITE, True)
         self.text("学会你", 62, 220, 66, GREEN, True)
         self.text("对手：观察者", 65, 335, 23, MUTED)
@@ -628,7 +629,7 @@ class GameApp:
 
     def _game(self) -> None:
         self.text("别让 AI 学会你",28,23,28,WHITE,True)
-        self.text("交锋 / V0.3",300,34,13,MUTED)
+        self.text(f"交锋 / V{__version__}",300,34,13,MUTED)
         minutes,seconds=divmod(int(self.world.time),60)
         self.text(f"{minutes:02d}:{seconds:02d}",720,29,24,MUTED,mono=True)
         self.button((850,22,158,35),"C  换对手重开","switch",size=13)

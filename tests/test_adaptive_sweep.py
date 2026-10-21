@@ -1,6 +1,7 @@
 """Causal sweep choices and escapes through ordinary, visible-state inputs."""
 
 from copy import deepcopy
+import json
 from math import hypot
 
 import pytest
@@ -9,6 +10,8 @@ from adaptive_boss.engine import (
     AIM_DURATION, BOSS_BODY_RADIUS, FIXED_STEP, InputState, LOCK_DURATION,
     SWEEP_RESPONSE_DISTANCE, World,
 )
+from adaptive_boss.learning import EXPERT_NAMES
+from adaptive_boss.telemetry import SessionRecorder
 
 
 def advance(world, seconds, controls=None):
@@ -129,6 +132,51 @@ def test_later_opposite_inputs_cannot_change_frozen_prediction_or_sweep():
     assert result["features"] == list(snapshot.features)
     assert result["samples_before"] == 8 and result["samples_after"] == 9
     assert result["decision_time"] < result["first_escape_time"] < result["time"]
+
+
+@pytest.mark.parametrize("kind", ["bomb", "sweep"])
+def test_diagnostic_logs_preserve_lock_snapshot_after_learning(kind, tmp_path):
+    world = World()
+    rehearse(world, kind, "cw")
+    world._attacks_started = int(kind == "sweep")
+    events = until_phase(world, "lock")
+    decision = next(event for event in events if event["type"] == "decision")
+    snapshot = world.prediction
+    labels = world.predictor.labels
+    frozen = {
+        "response_history": list(snapshot.response_history),
+        "markov_order": snapshot.markov_order,
+        "expert_weights": dict(zip(EXPERT_NAMES, snapshot.expert_weights)),
+        "expert_probabilities": {
+            name: dict(zip(labels, probabilities))
+            for name, probabilities in zip(EXPERT_NAMES, snapshot.expert_probabilities)
+        },
+    }
+    assert frozen["response_history"] == ["cw"] * 3
+    assert set(frozen["expert_weights"]) == {"frequency", "markov", "sgd"}
+    assert sum(frozen["expert_weights"].values()) == pytest.approx(1.0)
+    for probabilities in frozen["expert_probabilities"].values():
+        assert set(probabilities) == set(labels)
+        assert sum(probabilities.values()) == pytest.approx(1.0)
+
+    result = observation(until_phase(world, "recovery"))
+    assert result["actual"] == "stay"
+    assert result["samples_after"] == snapshot.samples + 1
+    current = world.predictor.predict(decision["context"])
+    assert current.response_history != snapshot.response_history
+    assert current.expert_probabilities != snapshot.expert_probabilities
+    for event in (decision, result):
+        assert {field: event[field] for field in frozen} == frozen
+
+    recorder = SessionRecorder(tmp_path, world.mode, 7)
+    try:
+        recorder.record(decision)
+        recorder.record(result)
+        records = [json.loads(line) for line in recorder.path.read_text(encoding="utf-8").splitlines()]
+        assert records[0]["schema_version"] == 3
+        assert records[1:] == [decision, result]
+    finally:
+        recorder.close()
 
 
 def test_first_twenty_pixels_freeze_choice_before_a_longer_rescue_movement():
