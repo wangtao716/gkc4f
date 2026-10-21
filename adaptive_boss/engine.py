@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import atan2, cos, hypot, isfinite, pi, sin
 from random import Random
+from secrets import randbits
 
 from .learning import BehaviorPredictor, DIRECTIONS, EXPERT_NAMES, PredictionSnapshot
 
@@ -216,17 +217,25 @@ class World:
     discarded; reset clears the match and model. Physics runs at fixed 120 Hz.
     """
 
-    def __init__(self, mode="adaptive", seed=7, width=860, height=540) -> None:
+    def __init__(self, mode="adaptive", seed: int | None = None, width=860, height=540) -> None:
         if not isfinite(width) or not isfinite(height) or width < 360 or height < 300:
             raise ValueError("Arena dimensions must be finite and at least 360 by 300")
         self.width, self.height = float(width), float(height)
-        self.seed, self.mode = seed, mode
+        self._fixed_seed, self.mode = seed, mode
+        self.seed: int | None = None
         self.reset()
 
     def reset(self, mode: str | None = None) -> None:
         selected_mode = self.mode if mode is None else mode
         if selected_mode not in ("adaptive", "fixed"):
             raise ValueError("mode must be 'adaptive' or 'fixed'")
+        if self._fixed_seed is None:
+            previous_seed = self.seed
+            self.seed = randbits(32)
+            while self.seed == previous_seed:
+                self.seed = randbits(32)
+        else:
+            self.seed = self._fixed_seed
         self.mode = selected_mode
         self.time = 0.0
         self.result: str | None = None
@@ -256,6 +265,8 @@ class World:
         self.sweep_attempts = self.sweep_hits = 0
         self.adaptive_sweep_attempts = self.adaptive_sweep_hits = 0
         self._rng = Random(self.seed)
+        # Keep skill selection independent of the direction/tactic draws.
+        self._attack_rng = Random(f"attack_kind:{self.seed}")
         self._accumulator = 0.0
         self._dash_was_down = self._pending_dash = False
         self._pending_dash_vector = self._dash_vector = (0.0, -1.0)
@@ -271,7 +282,7 @@ class World:
         self._first_escape: str | None = None
         self._first_escape_time: float | None = None
         self._escape_tangent = 0.0
-        self._attacks_started = self._attack_index = 0
+        self._attacks_started = 0
         self._has_counter = self._counter_activated = False
         self._sweep_sign = 1.0
         self._sweep_activated = self._sweep_hit = False
@@ -507,7 +518,7 @@ class World:
             self._lock_attack()
             self._set_phase("lock", LOCK_DURATION)
         elif self.phase == "lock":
-            self._set_phase("active", ACTIVE_DURATION if self._attack_index == 0 else SWEEP_DURATION)
+            self._set_phase("active", ACTIVE_DURATION if self.attack_kind == "bomb" else SWEEP_DURATION)
         elif self.phase == "active":
             if self._has_counter:
                 self._set_phase("followup", FOLLOWUP_WARNING_DURATION + FOLLOWUP_ACTIVE_DURATION)
@@ -524,8 +535,7 @@ class World:
         self._set_phase("recovery", RECOVERY_DURATION)
 
     def _begin_attack(self) -> None:
-        self._attack_index = self._attacks_started % 2
-        self.attack_kind = "bomb" if self._attack_index == 0 else "sweep"
+        self.attack_kind = self._attack_rng.choice(("bomb", "sweep"))
         self._has_counter = self.attack_kind == "bomb"
         self._attacks_started += 1
         self.prediction = self.strategy_direction = None
@@ -560,7 +570,7 @@ class World:
         self._sweep_sign = -1.0 if direction == "ccw" else 1.0
         self.tactic_label = {"cw": "顺时针侧封", "ccw": "逆时针侧封", "in": "近身封锁",
                              "out": "外沿拦截", "stay": "原点追击"}[direction]
-        if self._attack_index == 1:
+        if self.attack_kind == "sweep":
             self.tactic_label = "方向已封存"
         self._event("decision", mode=self.mode, attack=self.attack_name, context=list(context),
             prediction=snapshot.label, probabilities=dict(zip(self.predictor.labels, snapshot.probabilities)),
@@ -579,7 +589,7 @@ class World:
 
     def _main_geometry(self, target_x: float, target_y: float) -> Hazard:
         common = {"hazard_id": f"{self._attacks_started}:main", "attack_id": self._attacks_started}
-        if self._attack_index == 0:
+        if self.attack_kind == "bomb":
             return Hazard("circle", target_x, target_y, radius=60.0, **common)
         center = atan2(target_y - self.boss.y, target_x - self.boss.x)
         start = center

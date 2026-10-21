@@ -69,6 +69,9 @@ def test_visible_warning_pilot_finishes_a_real_match(mode, seed):
     assert world.boss.hp == 0
     assert world.total_samples == len(observed) >= 10
     assert world.total_correct == sum(event["correct"] for event in observed)
+    # These real random matches exercise back-to-back attacks of the same skill.
+    attack_kinds = [event["attack_kind"] for event in observed]
+    assert any(previous == current for previous, current in zip(attack_kinds, attack_kinds[1:]))
     for kind, predictor in world.predictors.items():
         skill_observations = [event for event in observed if event["attack_kind"] == kind]
         assert predictor.samples == len(skill_observations) >= 4

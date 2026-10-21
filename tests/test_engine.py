@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 from copy import deepcopy
 import json
 from math import atan2, cos, hypot, pi, sin
+from unittest.mock import Mock
 
 import pytest
 
@@ -36,15 +37,18 @@ def until_phase(world, phase, controls=None):
     pytest.fail(f"Never reached {phase}; current phase {world.phase}")
 
 
-def begin_attack(world, attack_index=0):
-    world._attacks_started = attack_index
+def begin_attack(world, attack_kind="bomb", *, attacks_started=None):
+    world._attack_rng.choice = Mock(return_value=attack_kind)
+    if attacks_started is not None:
+        world._attacks_started = attacks_started
     events = advance(world, 1.0)
     assert world.phase == "aim"
+    assert world.attack_kind == attack_kind
     return events
 
 
 def test_aim_and_lock_are_safe_then_main_attack_opens_a_real_punish_window():
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     advance(world, AIM_DURATION)
     assert world.phase == "lock"
@@ -68,8 +72,8 @@ def test_aim_and_lock_are_safe_then_main_attack_opens_a_real_punish_window():
 
 
 def test_tracking_is_visible_but_tactics_and_locked_geometry_never_read_later_inputs():
-    world = World()
-    begin_attack(world, attack_index=2)
+    world = World(seed=7)
+    begin_attack(world)
     assert world.prediction is None and world.strategy_direction is None
     first_x = world.hazards[0].x
     advance(world, 0.3, InputState(move_x=1))
@@ -94,8 +98,8 @@ def test_tracking_is_visible_but_tactics_and_locked_geometry_never_read_later_in
 
 
 def test_delayed_counter_has_its_own_safe_warning_and_reports_actual_hits():
-    world = World()
-    begin_attack(world, attack_index=2)
+    world = World(seed=7)
+    begin_attack(world, attacks_started=2)
     until_phase(world, "lock")
     counter = world._locked_counter
     world.player.x, world.player.y = counter.x, counter.y
@@ -117,12 +121,12 @@ def test_delayed_counter_has_its_own_safe_warning_and_reports_actual_hits():
 
 
 def test_orbit_counter_leads_the_full_delay_using_speed_committed_before_response():
-    world = World()
+    world = World(seed=7)
     world._observed_move_speed = 100.0
     snapshot = replace(world.predictor.predict([0.5, 0.79, 0, 0.43, 0.23, 0]),
                        ready=True, confidence=0.9, samples=3, label="cw")
     world.predictor.predict = lambda context: snapshot
-    events = begin_attack(world, attack_index=2)
+    events = begin_attack(world)
     events.extend(until_phase(world, "lock"))
     decision = next(event for event in events if event["type"] == "decision")
     assert decision["movement_speed_estimate"] == 100.0
@@ -139,7 +143,7 @@ def test_orbit_counter_leads_the_full_delay_using_speed_committed_before_respons
 
 
 def test_charge_only_fires_on_release_and_can_be_held_at_full_indefinitely():
-    world = World()
+    world = World(seed=7)
     events = advance(world, CHARGE_DURATION + 0.3, InputState(attack=True))
     assert world.player.charging
     assert world.player.charge == CHARGE_DURATION
@@ -155,7 +159,7 @@ def test_charge_only_fires_on_release_and_can_be_held_at_full_indefinitely():
 
 
 def test_release_and_repress_in_one_frame_fire_once_and_restart_charge():
-    world = World()
+    world = World(seed=7)
     advance(world, CHARGE_DURATION, InputState(attack=True))
     world.update(FIXED_STEP, InputState(0, 0, True, False, (False, True)))
     shots = [event for event in world.events if event["type"] == "attack"]
@@ -167,7 +171,7 @@ def test_release_and_repress_in_one_frame_fire_once_and_restart_charge():
 
 
 def test_ordered_release_repress_edges_survive_a_substep_frame():
-    world = World()
+    world = World(seed=7)
     advance(world, CHARGE_DURATION, InputState(attack=True))
     world.update(FIXED_STEP / 2, InputState(attack=True, attack_edges=(False, True)))
     assert world.events == [] and world.player.charge == pytest.approx(CHARGE_DURATION)
@@ -177,7 +181,7 @@ def test_ordered_release_repress_edges_survive_a_substep_frame():
 
 
 def test_dash_cancels_old_charge_and_ordered_repress_in_the_same_frame():
-    world = World()
+    world = World(seed=7)
     advance(world, CHARGE_DURATION, InputState(attack=True))
     world.update(FIXED_STEP, InputState(attack=True, dash=True, attack_edges=(False, True)))
     assert not any(event["type"] == "attack" for event in world.events)
@@ -190,7 +194,7 @@ def test_dash_cancels_old_charge_and_ordered_repress_in_the_same_frame():
 
 
 def test_charge_slows_normal_movement_and_partial_charge_has_lower_damage():
-    normal, charging = World(), World()
+    normal, charging = World(seed=7), World(seed=7)
     advance(normal, 0.3, InputState(move_x=1))
     advance(charging, 0.3, InputState(move_x=1, attack=True))
     start_x = normal.width / 2
@@ -201,7 +205,7 @@ def test_charge_slows_normal_movement_and_partial_charge_has_lower_damage():
 
 
 def test_dash_cancels_charge_and_requires_release_then_new_press():
-    world = World()
+    world = World(seed=7)
     advance(world, 0.5, InputState(attack=True))
     world.update(FIXED_STEP, InputState(move_x=1, attack=True, dash=True))
     assert world.player.charge == 0 and not world.player.charging
@@ -217,7 +221,7 @@ def test_dash_cancels_charge_and_requires_release_then_new_press():
 
 
 def test_rejected_dash_preserves_charge_and_release_dash_does_not_fire():
-    world = World()
+    world = World(seed=7)
     advance(world, 0.5, InputState(attack=True))
     world.player.dash_cooldown = 1
     world.update(FIXED_STEP, InputState(attack=True, dash=True))
@@ -229,7 +233,7 @@ def test_rejected_dash_preserves_charge_and_release_dash_does_not_fire():
 
 
 def test_cancel_actions_drops_charge_without_firing_on_resume():
-    world = World()
+    world = World(seed=7)
     advance(world, CHARGE_DURATION, InputState(attack=True))
     assert world.player.charging
     world.cancel_actions()
@@ -242,7 +246,7 @@ def test_cancel_actions_drops_charge_without_firing_on_resume():
 
 
 def test_cancel_actions_clears_short_frame_edges_without_resetting_dash_cost():
-    world = World()
+    world = World(seed=7)
     world.update(FIXED_STEP / 2, InputState(attack=True, dash=True))
     world.cancel_actions()
     world.update(FIXED_STEP / 2, InputState())
@@ -261,7 +265,7 @@ def test_cancel_actions_clears_short_frame_edges_without_resetting_dash_cost():
 
 @pytest.mark.parametrize("move_x,move_y,label", [(-1, 0, "cw"), (1, 0, "ccw"), (0, -1, "in"), (0, 1, "out")])
 def test_ordinary_walking_labels_relative_to_boss(move_x, move_y, label):
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     until_phase(world, "lock")
     advance(world, 0.3, InputState(move_x=move_x, move_y=move_y))
@@ -273,7 +277,7 @@ def test_ordinary_walking_labels_relative_to_boss(move_x, move_y, label):
 
 
 def test_blocked_dash_cannot_manufacture_movement_and_later_walking_counts():
-    world = World()
+    world = World(seed=7)
     world.player.x = world.player.radius
     begin_attack(world)
     until_phase(world, "lock")
@@ -281,7 +285,7 @@ def test_blocked_dash_cannot_manufacture_movement_and_later_walking_counts():
     advance(world, 0.2)
     until_phase(world, "recovery")
     assert world.last_response == "stay"
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     until_phase(world, "lock")
     world.player.dash_cooldown = 2.0
@@ -291,7 +295,7 @@ def test_blocked_dash_cannot_manufacture_movement_and_later_walking_counts():
 
 
 def test_response_includes_movement_after_first_dash():
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     until_phase(world, "lock")
     world.player.invulnerability = 20
@@ -302,7 +306,7 @@ def test_response_includes_movement_after_first_dash():
 
 
 def test_large_round_trip_is_movement_even_when_net_displacement_cancels():
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     until_phase(world, "lock")
     start = (world.player.x, world.player.y)
@@ -319,7 +323,7 @@ def test_large_round_trip_is_movement_even_when_net_displacement_cancels():
 
 
 def test_held_dash_does_not_repeat_and_new_press_can_dash():
-    world = World()
+    world = World(seed=7)
     start_y = world.player.y
     events = advance(world, 2.4, InputState(dash=True))
     assert sum(event["type"] == "dash" for event in events) == 1
@@ -332,7 +336,7 @@ def test_held_dash_does_not_repeat_and_new_press_can_dash():
 
 
 def test_dash_invulnerability_is_separate_from_leaving_a_danger_zone():
-    world = World()
+    world = World(seed=7)
     world.phase = "active"
     world.phase_remaining = 5
     world.hazards = [Hazard("circle", world.player.x, world.player.y, radius=500, active=True)]
@@ -376,7 +380,7 @@ def test_rotating_beam_cannot_skip_player_between_physics_steps():
 
 
 def test_fast_projectile_cannot_tunnel_and_exposed_boss_takes_more_damage():
-    armored, exposed = World(), World()
+    armored, exposed = World(seed=7), World(seed=7)
     exposed._set_phase("recovery", 5)
     for world in (armored, exposed):
         world.projectiles.append(Projectile(world.boss.x - 100, world.boss.y, 50000, 0,
@@ -392,7 +396,7 @@ def test_fast_projectile_cannot_tunnel_and_exposed_boss_takes_more_damage():
     (1.0, False, 12), (0.0, True, 5), (1.0, True, 69),
 ])
 def test_armor_blocks_light_shots_and_charge_has_a_real_payoff(charge, exposed, expected):
-    world = World()
+    world = World(seed=7)
     world._set_phase("recovery" if exposed else "idle", 5)
     world._shoot(charge * CHARGE_DURATION)
     events = advance(world, 0.4)
@@ -405,7 +409,7 @@ def test_armor_blocks_light_shots_and_charge_has_a_real_payoff(charge, exposed, 
 
 
 def test_unlimited_tapping_cannot_chip_through_armor():
-    world = World()
+    world = World(seed=7)
     world._set_phase("idle", 15)
     events = []
     for tick in range(10 * 120):
@@ -416,9 +420,9 @@ def test_unlimited_tapping_cannot_chip_through_armor():
 
 
 def test_sweep_moves_along_committed_arc_and_collision_uses_current_beam():
-    first, second = World(), World()
+    first, second = World(seed=7), World(seed=7)
     for world in (first, second):
-        begin_attack(world, attack_index=1)
+        begin_attack(world, "sweep")
         until_phase(world, "active")
         world.player.invulnerability = 20
     start = first.hazards[0].angle
@@ -453,7 +457,7 @@ def test_same_inputs_produce_same_simulation_at_different_display_fps():
     ("adaptive", False, 0.9, False), ("fixed", True, 0.9, False),
 ])
 def test_prediction_only_drives_tactics_after_warmup_and_confidence_threshold(mode, ready, confidence, expected):
-    world = World(mode=mode)
+    world = World(seed=7, mode=mode)
     snapshot = replace(world.predictor.predict([0.5, 0.79, 0, 0.43, 0.23, 0]),
                        ready=ready, confidence=confidence, samples=3, label="cw")
     world.predictor.predict = lambda context: snapshot
@@ -465,11 +469,11 @@ def test_prediction_only_drives_tactics_after_warmup_and_confidence_threshold(mo
 
 
 def test_fixed_mode_observes_without_using_its_prediction():
-    fixed, adaptive = World(mode="fixed"), World(mode="adaptive")
+    fixed, adaptive = World(seed=7, mode="fixed"), World(seed=7, mode="adaptive")
     for world in (fixed, adaptive):
         for _ in range(8):
             world.predictor.observe(world.predictor.predict([0.5, 0.79, 0, 0.43, 0.23, 0]), "cw")
-        begin_attack(world, attack_index=2)
+        begin_attack(world)
         until_phase(world, "lock")
         assert world.prediction.ready and world.prediction.label == "cw"
     assert fixed.strategy_direction == "in" and not fixed.using_prediction
@@ -487,15 +491,15 @@ def test_planned_attacks_leave_reachable_safe_destinations_including_corners():
     # follow-up. Crossing a sweep during a dash is a legitimate escape route.
     for position in ((14, 14), (846, 14), (14, 526), (846, 526),
                      (430, 14), (14, 270), (430, 270), (430, 194.4)):
-        for attack_index in (1, 2):
-            for direction in (("cw", "ccw") if attack_index == 1 else DIRECTIONS):
-                world = World()
+        for attack_kind in ("sweep", "bomb"):
+            for direction in (("cw", "ccw") if attack_kind == "sweep" else DIRECTIONS):
+                world = World(seed=7)
                 world.player.x, world.player.y = position
-                model = world.predictors["sweep" if attack_index == 1 else "bomb"]
+                model = world.predictors[attack_kind]
                 snapshot = replace(model.predict([0.5, 0.5, 0, 0, 0, 0]),
                                    ready=True, confidence=0.9, samples=3, label=direction)
                 model.predict = lambda context: snapshot
-                begin_attack(world, attack_index)
+                begin_attack(world, attack_kind)
                 until_phase(world, "lock")
                 safe = False
                 for angle_index in range(16):
@@ -518,19 +522,98 @@ def test_planned_attacks_leave_reachable_safe_destinations_including_corners():
                 assert safe, (position, world.attack_name, direction)
 
 
-def test_only_bombardments_have_delayed_counters():
-    world = World()
-    world.player.invulnerability = 100
-    events = advance(world, 25)
-    decisions = [event for event in events if event["type"] == "decision"]
-    assert [event["attack_kind"] for event in decisions[:4]] == ["bomb", "sweep", "bomb", "sweep"]
-    assert [event["has_counter"] for event in decisions[:4]] == [True, False, True, False]
-    assert all(event["attack_kind"] == "bomb" for event in events
-               if event["type"] == "phase" and event["phase"] == "followup")
+@pytest.mark.parametrize("sequence", [
+    ("bomb", "bomb", "sweep", "sweep", "bomb"),
+    ("sweep", "sweep", "bomb", "bomb", "sweep"),
+])
+def test_random_attacks_can_start_with_either_skill_and_repeat_without_stale_state(sequence):
+    world = World(seed=7)
+    world._attack_rng.choice = Mock(side_effect=sequence)
+    counts = {"bomb": 0, "sweep": 0}
+    previous_snapshot = previous_main = None
+    for attack_id, kind in enumerate(sequence, 1):
+        until_phase(world, "aim")
+        world.player.hp = world.player.max_hp
+        world.player.invulnerability = 0
+        assert world.attack_kind == kind
+        assert world._attack_rng.choice.call_count == attack_id
+        assert world.prediction is world.strategy_direction is None
+        assert world._pending_snapshot is None
+        assert world._locked_main is world._locked_counter is None
+        assert not world._counter_activated and not world._sweep_activated and not world._sweep_hit
+        assert world.hazards[0].kind == ("circle" if kind == "bomb" else "beam")
+        assert world.hazards[0].hazard_id == f"{attack_id}:main"
+
+        events = until_phase(world, "lock")
+        decision = next(event for event in events if event["type"] == "decision")
+        assert decision["attack_kind"] == kind and decision["attack_id"] == attack_id
+        assert decision["has_counter"] is (kind == "bomb")
+        assert world.predictor is world.predictors[kind]
+        assert world.prediction.samples == counts[kind]
+        assert world.prediction is world._pending_snapshot
+        assert world.prediction is not previous_snapshot
+        assert world._locked_main is not previous_main
+        previous_snapshot, previous_main = world.prediction, world._locked_main
+        if kind == "bomb":
+            assert world._locked_main.sweep_end_angle is None
+            assert world._locked_counter.hazard_id == f"{attack_id}:counter"
+            assert world._locked_counter.is_counter
+        else:
+            assert world._locked_main.sweep_end_angle is not None
+            assert world._locked_counter is None
+
+        events.extend(until_phase(world, "active"))
+        assert world.phase_duration == (ACTIVE_DURATION if kind == "bomb" else SWEEP_DURATION)
+        events.extend(until_phase(world, "recovery"))
+        assert any(event.get("phase") == "followup" for event in events) is (kind == "bomb")
+        assert world._counter_activated is (kind == "bomb")
+        assert world._sweep_activated is world._sweep_hit is (kind == "sweep")
+        counts[kind] += 1
+        result = next(event for event in events if event["type"] == "observation")
+        assert result["attack_kind"] == kind and result["attack_id"] == attack_id
+        assert result["samples_before"] == counts[kind] - 1
+        assert result["samples_after"] == counts[kind]
+        assert world.counter_attempts == counts["bomb"]
+        assert world.sweep_attempts == world.sweep_hits == counts["sweep"]
+        assert {kind: model.samples for kind, model in world.predictors.items()} == counts
+        assert world.completed_attacks == world.total_samples == attack_id
+        assert world.hazards == [] and world.boss.exposed
+
+
+def completed_attack_sequence(world, count=24, extra_direction_draws=0):
+    world.player.invulnerability = 1000
+    sequence = []
+    for _ in range(count):
+        for _ in range(extra_direction_draws):
+            world._rng.random()
+        until_phase(world, "aim")
+        sequence.append(world.attack_kind)
+        until_phase(world, "recovery")
+    return sequence
+
+
+@pytest.mark.parametrize("mode", ["adaptive", "fixed"])
+def test_attack_sequence_replays_after_reset_and_changes_with_seed(mode):
+    world = World(seed=12, mode=mode)
+    expected = completed_attack_sequence(world)
+    assert set(expected) == {"bomb", "sweep"}
+    assert all((kind, kind) in zip(expected, expected[1:]) for kind in ("bomb", "sweep"))
+    world.reset()
+    assert completed_attack_sequence(world) == expected
+    assert completed_attack_sequence(World(seed=12, mode=mode)) == expected
+    assert completed_attack_sequence(World(seed=13, mode=mode)) != expected
+
+
+def test_attack_sequence_is_independent_of_mode_and_direction_randomness():
+    fixed, adaptive = World(seed=29, mode="fixed"), World(seed=29, mode="adaptive")
+    for model in adaptive.predictors.values():
+        for _ in range(8):
+            model.observe(model.predict([0.5, 0.79, 0, 0.43, 0.23, 0]), "cw")
+    assert completed_attack_sequence(adaptive, extra_direction_draws=7) == completed_attack_sequence(fixed)
 
 
 def test_full_charge_release_play_can_win_in_sixty_to_one_hundred_twenty_seconds():
-    world = World()
+    world = World(seed=7)
     world.player.invulnerability = 300
     events = []
     cycle_ticks = round(CHARGE_DURATION / FIXED_STEP) + 1
@@ -551,7 +634,7 @@ def test_full_charge_release_play_can_win_in_sixty_to_one_hundred_twenty_seconds
 
 
 def test_loss_emits_once_and_discards_unfinished_response():
-    world = World()
+    world = World(seed=7)
     begin_attack(world)
     world.player.hp = 1
     events = advance(world, 2)
@@ -561,7 +644,7 @@ def test_loss_emits_once_and_discards_unfinished_response():
 
 
 def test_reset_clears_match_model_charge_and_pending_inputs():
-    world = World()
+    world = World(seed=7)
     advance(world, 4, InputState(attack=True, dash=True))
     assert world.predictor.samples > 0
     world.reset(mode="fixed")
@@ -579,16 +662,16 @@ def test_reset_clears_match_model_charge_and_pending_inputs():
 @pytest.mark.parametrize("dt", [-0.1, float("nan"), float("inf")])
 def test_invalid_time_is_rejected(dt):
     with pytest.raises(ValueError):
-        World().update(dt, InputState())
+        World(seed=7).update(dt, InputState())
 
 
 def test_short_frames_preserve_dash_and_charge_button_edges():
-    world = World()
+    world = World(seed=7)
     world.update(FIXED_STEP / 2, InputState(move_x=1, dash=True))
     assert world.events == []
     world.update(FIXED_STEP / 2, InputState())
     assert any(event["type"] == "dash" and event["direction"] == "right" for event in world.events)
-    world = World()
+    world = World(seed=7)
     world.update(FIXED_STEP / 2, InputState(attack=True))
     world.update(FIXED_STEP / 2, InputState())
     assert any(event["type"] == "attack" for event in world.events)

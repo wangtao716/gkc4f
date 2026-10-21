@@ -10,7 +10,7 @@ from adaptive_boss.input import KeyboardInput
 
 
 def open_space():
-    world = World()
+    world = World(seed=7)
     world.player.x, world.player.y = 645.0, 270.0
     return world
 

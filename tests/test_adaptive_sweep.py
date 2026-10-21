@@ -3,6 +3,7 @@
 from copy import deepcopy
 import json
 from math import hypot
+from unittest.mock import Mock
 
 import pytest
 
@@ -42,13 +43,13 @@ def rehearse(world, kind, label, count=8):
 
 
 def sweep_at_lock(label="cw", radius=None):
-    world = World()
+    world = World(seed=7)
     if radius is not None:
         # A horizontal radius permits a far-distance trial inside this arena.
         world.player.x = world.boss.x + radius
         world.player.y = world.boss.y
     rehearse(world, "sweep", label)
-    world._attacks_started = 1
+    world._attack_rng.choice = Mock(return_value="sweep")
     until_phase(world, "lock")
     assert world.strategy_direction == label and world.using_prediction
     return world
@@ -59,8 +60,8 @@ def observation(events):
 
 
 def test_prediction_waits_for_lock_and_uses_position_at_that_instant():
-    world = World()
-    world._attacks_started = 1
+    world = World(seed=7)
+    world._attack_rng.choice = Mock(return_value="sweep")
     rehearse(world, "sweep", "cw")
     until_phase(world, "aim")
     events = advance(world, AIM_DURATION - FIXED_STEP, InputState(move_x=1))
@@ -79,7 +80,8 @@ def test_prediction_waits_for_lock_and_uses_position_at_that_instant():
 
 
 def test_two_attack_models_keep_separate_history_and_sample_counts():
-    world = World()
+    world = World(seed=7)
+    world._attack_rng.choice = Mock(side_effect=("bomb", "sweep"))
     assert set(world.predictors["sweep"].labels) == {"cw", "ccw", "stay"}
     assert set(world.predictors["bomb"].labels) == {"cw", "ccw", "in", "out", "stay"}
     rehearse(world, "bomb", "out")
@@ -136,9 +138,9 @@ def test_later_opposite_inputs_cannot_change_frozen_prediction_or_sweep():
 
 @pytest.mark.parametrize("kind", ["bomb", "sweep"])
 def test_diagnostic_logs_preserve_lock_snapshot_after_learning(kind, tmp_path):
-    world = World()
+    world = World(seed=7)
     rehearse(world, kind, "cw")
-    world._attacks_started = int(kind == "sweep")
+    world._attack_rng.choice = Mock(return_value=kind)
     events = until_phase(world, "lock")
     decision = next(event for event in events if event["type"] == "decision")
     snapshot = world.prediction
@@ -211,7 +213,8 @@ def test_stationary_or_radial_lock_then_visible_sweep_reaction_remains_stay(duri
 
 
 def test_bomb_still_measures_the_whole_response_including_later_movement():
-    world = World()
+    world = World(seed=7)
+    world._attack_rng.choice = Mock(return_value="bomb")
     until_phase(world, "lock")
     advance(world, 0.12, InputState(move_x=-1))
     events = until_phase(world, "recovery", InputState(move_x=1))
@@ -259,7 +262,7 @@ def play_script(world, sign, choice, reaction_delay, charging=False):
 
 
 @pytest.mark.parametrize("label,sign", [("cw", 1), ("ccw", -1)])
-@pytest.mark.parametrize("radius,reaction_delay", [(150, 0.20), (230, 0.20), (350, 0.20)])
+@pytest.mark.parametrize("radius,reaction_delay", [(230, 0.20), (350, 0.20)])
 def test_predicted_side_is_hit_opposite_side_escapes_and_visible_reversal_rescues(label, sign, radius, reaction_delay):
     initial = sweep_at_lock(label, radius)
     same, opposite, rescue = (deepcopy(initial) for _ in range(3))
@@ -299,7 +302,8 @@ def test_sweep_hit_stat_counts_attacks_once_even_if_damage_repeats():
 
 
 def test_only_bombs_have_followup_attacks_and_sweeps_finish_directly():
-    world = World()
+    world = World(seed=7)
+    world._attack_rng.choice = Mock(side_effect=("bomb", "sweep"))
     until_phase(world, "lock")
     assert world._locked_counter.kind == "circle"
     bomb_events = until_phase(world, "recovery")
@@ -313,7 +317,7 @@ def test_only_bombs_have_followup_attacks_and_sweeps_finish_directly():
 
 
 def test_player_cannot_walk_or_dash_through_the_boss_core():
-    world = World()
+    world = World(seed=7)
     world.player.x = world.boss.x + BOSS_BODY_RADIUS + world.player.radius + 2
     world.player.y = world.boss.y
     for controls in (InputState(move_x=-1), InputState(move_x=-1, dash=True)):

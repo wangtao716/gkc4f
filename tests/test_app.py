@@ -1,14 +1,17 @@
 """Exercise the real Pygame app lifecycle using SDL's invisible test drivers."""
 
+import json
 import os
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
 import pytest
 
+from adaptive_boss import app as app_module, engine
 from adaptive_boss.app import GameApp, SIZE
 from adaptive_boss.engine import CHARGE_DURATION, InputState
 
@@ -17,7 +20,7 @@ from adaptive_boss.engine import CHARGE_DURATION, InputState
 def app(monkeypatch):
     monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
     monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
-    game = GameApp(headless=True, record=False, mute=True)
+    game = GameApp(seed=7, headless=True, record=False, mute=True)
     pygame.event.clear()
     try:
         yield game
@@ -73,15 +76,15 @@ def test_enter_starts_a_fresh_match_without_logs_or_sound(app):
 
 def test_pause_freezes_combat_and_learning_then_resume_advances(app):
     start(app)
-    advance_until(app, lambda: app.world.predictor.samples >= 1)
-    assert app.world.predictor.samples == 1
+    advance_until(app, lambda: app.world.total_samples >= 1)
+    assert app.world.total_samples == 1
     press(app, pygame.K_ESCAPE)
     assert app.scene == "paused"
     frozen = (app.world.time, app.world.player.hp, app.world.boss.hp,
-              app.world.predictor.samples, app.world.phase_remaining)
+              app.world.total_samples, app.world.phase_remaining)
     app.update(10.0, InputState(move_x=1, attack=True, dash=True))
     assert (app.world.time, app.world.player.hp, app.world.boss.hp,
-            app.world.predictor.samples, app.world.phase_remaining) == frozen
+            app.world.total_samples, app.world.phase_remaining) == frozen
     press(app, pygame.K_RETURN)
     assert app.scene == "playing"
     app.update(0.1)
@@ -95,17 +98,18 @@ def test_restart_discards_old_model_state_and_held_keys(app):
     assert app.world.boss.hp == app.world.boss.max_hp
     controls = app.handle_events([keyup(pygame.K_j)])
     app.update(1 / 60, controls)
-    advance_until(app, lambda: app.world.predictor.samples >= 1)
-    assert app.world.predictor.samples == 1
-    old_model = app.world.predictor
+    advance_until(app, lambda: app.world.total_samples >= 1)
+    assert app.world.total_samples == 1
+    old_models = app.world.predictors.copy()
     assert app.world.boss.hp < app.world.boss.max_hp
     press(app, pygame.K_j)
     controls = press(app, pygame.K_r)
     assert app.scene == "playing"
     assert app.world.time == 0
-    assert app.world.predictor is not old_model
-    assert app.world.predictor.samples == 0
-    assert app.world.predictor.history == []
+    assert app.world.total_samples == 0
+    for kind, model in app.world.predictors.items():
+        assert model is not old_models[kind]
+        assert model.history == []
     assert app.world.player.hp == app.world.player.max_hp
     assert app.world.boss.hp == app.world.boss.max_hp
     assert not controls.attack
@@ -114,18 +118,62 @@ def test_restart_discards_old_model_state_and_held_keys(app):
 
 def test_c_switches_opponent_and_restarts_the_match(app):
     start(app)
-    advance_until(app, lambda: app.world.predictor.samples >= 1)
+    advance_until(app, lambda: app.world.total_samples >= 1)
     assert app.mode == "adaptive"
-    assert app.world.predictor.samples == 1
+    assert app.world.total_samples == 1
     press(app, pygame.K_c)
     assert app.mode == app.world.mode == "fixed"
     assert app.scene == "playing"
     assert app.world.time == 0
-    assert app.world.predictor.samples == 0
+    assert app.world.total_samples == 0
     app.update(0.2)
     press(app, pygame.K_c)
     assert app.mode == app.world.mode == "adaptive"
     assert app.world.time == 0
+
+
+@pytest.mark.parametrize("fixed_seed", [None, 7])
+def test_match_starts_restarts_and_mode_switches_record_the_actual_seed(
+        monkeypatch, tmp_path, fixed_seed):
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    monkeypatch.setattr(app_module, "ROOT", tmp_path)
+    entropy = Mock(side_effect=[101, 202, 303, 404])
+    monkeypatch.setattr(engine, "randbits", entropy)
+    options = {} if fixed_seed is None else {"seed": fixed_seed}
+    game = GameApp(headless=True, record=True, mute=True, **options)
+    pygame.event.clear()
+    paths = []
+    expected_seeds = (202, 303, 404) if fixed_seed is None else (7, 7, 7)
+    try:
+        assert game.scene == "menu"
+        assert game.world.seed == (101 if fixed_seed is None else 7)
+        assert game.recorder is None
+        for key, seed, mode in zip(
+                (pygame.K_RETURN, pygame.K_r, pygame.K_c), expected_seeds,
+                ("adaptive", "adaptive", "fixed")):
+            press(game, key)
+            assert game.scene == "playing"
+            assert game.mode == game.world.mode == mode
+            assert game.world.seed == seed
+            assert game.log_path is not None
+            assert game.log_path not in paths
+            paths.append(game.log_path)
+            metadata = json.loads(game.log_path.read_text(encoding="utf-8").splitlines()[0])
+            assert metadata["type"] == "session_start"
+            assert metadata["seed"] == game.world.seed
+            assert metadata["mode"] == game.world.mode
+            assert not game.log_warning
+            game.update(0.1)
+        if fixed_seed is None:
+            assert entropy.call_count == 4
+        else:
+            entropy.assert_not_called()
+    finally:
+        game.close()
+    for path in paths:
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert records[-1]["type"] == "session_end"
 
 
 @pytest.mark.parametrize("outcome", ["win", "lose"])

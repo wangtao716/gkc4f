@@ -54,7 +54,7 @@ class KeyboardInputTests(unittest.TestCase):
         self.assertEqual(released.attack_edges, (False,))
 
     def test_same_batch_release_and_repress_fires_then_starts_a_new_charge(self):
-        keyboard, world = KeyboardInput(), World()
+        keyboard, world = KeyboardInput(), World(seed=7)
         world.update(CHARGE_DURATION, keyboard.poll([key_down(pygame.K_j)]))
         controls = keyboard.poll([key_up(pygame.K_j), key_down(pygame.K_j)])
         self.assertEqual(controls.attack_edges, (False, True))
@@ -67,7 +67,7 @@ class KeyboardInputTests(unittest.TestCase):
         self.assertEqual(keyboard.poll([]).attack_edges, ())
 
     def test_same_batch_tap_produces_a_light_shot(self):
-        keyboard, world = KeyboardInput(), World()
+        keyboard, world = KeyboardInput(), World(seed=7)
         controls = keyboard.poll([key_down(pygame.K_j), key_up(pygame.K_j)])
         self.assertFalse(controls.attack)
         self.assertEqual(controls.attack_edges, (True, False))

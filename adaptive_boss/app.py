@@ -97,7 +97,7 @@ class Spark:
 
 
 class GameApp:
-    def __init__(self, mode: str = "adaptive", seed: int = 7, mute: bool = False,
+    def __init__(self, mode: str = "adaptive", seed: int | None = None, mute: bool = False,
                  headless: bool = False, record: bool = True) -> None:
         if headless:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -185,7 +185,7 @@ class GameApp:
         self.log_warning = False
         if self.record:
             try:
-                self.recorder = SessionRecorder(ROOT / "runs", self.mode, self.seed,
+                self.recorder = SessionRecorder(ROOT / "runs", self.mode, self.world.seed,
                                                 input_source=self.input_source)
                 self.log_path = self.recorder.path
             except OSError:
@@ -763,7 +763,8 @@ class GameApp:
 def main(argv: Sequence[str] | None = None) -> int:
     parser=argparse.ArgumentParser(description="别让 AI 学会你 — 键盘 Boss 对战原型")
     parser.add_argument("--mode",choices=("adaptive","fixed"),default="adaptive")
-    parser.add_argument("--seed",type=int,default=7)
+    parser.add_argument("--seed",type=int,default=None,
+                        help="固定随机种子以便复现；默认每局生成新种子")
     parser.add_argument("--mute",action="store_true",help="关闭音效")
     parser.add_argument("--headless",action="store_true",help="使用虚拟显示，配合 --smoke-test 验证")
     parser.add_argument("--smoke-test",action="store_true",help="自动演练并退出")
