@@ -25,8 +25,10 @@ def test_metadata_is_flushed_immediately_and_uses_utc(tmp_path):
         assert start["mode"] == "adaptive"
         assert start["seed"] == 7
         assert start["input_source"] == "keyboard"
+        assert start["boss_attack"] is None
         assert datetime.fromisoformat(start["started_at"]).utcoffset() == timedelta(0)
-        assert set(start) == {"type", "schema_version", "mode", "seed", "started_at", "input_source"}
+        assert set(start) == {"type", "schema_version", "mode", "seed", "started_at",
+                              "input_source", "boss_attack"}
         assert recorder.path.suffix == ".jsonl"
     finally:
         recorder.close()

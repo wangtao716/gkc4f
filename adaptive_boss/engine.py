@@ -28,10 +28,10 @@ PROJECTILE_SPEED = 740.0
 PLAYER_HIT_DAMAGE = 16
 HIT_INVULNERABILITY = 0.75
 AIM_DURATION = 0.80
-LOCK_DURATION = 0.55
+LOCK_DURATION = 0.45
 WINDUP_DURATION = AIM_DURATION + LOCK_DURATION
 ACTIVE_DURATION = 0.28
-SWEEP_DURATION = 1.00
+SWEEP_DURATION = 0.80
 FOLLOWUP_WARNING_DURATION = 0.25
 FOLLOWUP_ACTIVE_DURATION = 0.55
 RECOVERY_DURATION = 1.40
@@ -43,6 +43,7 @@ BOSS_BODY_RADIUS = 44.0
 ARMOR_CHARGE_THRESHOLD = 0.50
 ARMOR_MULTIPLIER = 0.28
 EXPOSED_MULTIPLIER = 1.65
+ATTACK_KINDS = ("bomb", "sweep")
 
 
 def _prediction_diagnostics(snapshot: PredictionSnapshot, labels: tuple[str, ...]) -> dict:
@@ -104,8 +105,8 @@ class Boss:
     x: float
     y: float
     radius: float = 34.0
-    hp: int = 2400
-    max_hp: int = 2400
+    hp: int = 1500
+    max_hp: int = 1500
     exposed: bool = False
     facing: float = pi / 2.0
 
@@ -217,11 +218,15 @@ class World:
     discarded; reset clears the match and model. Physics runs at fixed 120 Hz.
     """
 
-    def __init__(self, mode="adaptive", seed: int | None = None, width=860, height=540) -> None:
+    def __init__(self, mode="adaptive", seed: int | None = None, width=860, height=540,
+                 boss_attack: str | None = None) -> None:
         if not isfinite(width) or not isfinite(height) or width < 360 or height < 300:
             raise ValueError("Arena dimensions must be finite and at least 360 by 300")
+        if boss_attack is not None and boss_attack not in ATTACK_KINDS:
+            raise ValueError("boss_attack must be 'bomb', 'sweep', or None")
         self.width, self.height = float(width), float(height)
         self._fixed_seed, self.mode = seed, mode
+        self.boss_attack = boss_attack
         self.seed: int | None = None
         self.reset()
 
@@ -248,7 +253,7 @@ class World:
             "bomb": BehaviorPredictor(seed=self.seed, min_samples=3),
             "sweep": BehaviorPredictor(seed=self.seed, min_samples=3, labels=("cw", "ccw", "stay")),
         }
-        self.attack_kind = "bomb"
+        self.attack_kind = self.boss_attack or "bomb"
         self.prediction: PredictionSnapshot | None = None
         self.attack_name = "准备就绪"
         self.tactic_label = "观察走位"
@@ -535,7 +540,7 @@ class World:
         self._set_phase("recovery", RECOVERY_DURATION)
 
     def _begin_attack(self) -> None:
-        self.attack_kind = self._attack_rng.choice(("bomb", "sweep"))
+        self.attack_kind = self.boss_attack or self._attack_rng.choice(ATTACK_KINDS)
         self._has_counter = self.attack_kind == "bomb"
         self._attacks_started += 1
         self.prediction = self.strategy_direction = None

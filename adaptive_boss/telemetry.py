@@ -34,7 +34,7 @@ class SessionRecorder:
     """
 
     def __init__(self, directory: Path | str, mode: str, seed: int,
-                 input_source: str = "keyboard") -> None:
+                 input_source: str = "keyboard", boss_attack: str | None = None) -> None:
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
         started = _utc_now()
@@ -57,6 +57,7 @@ class SessionRecorder:
                 "mode": mode,
                 "seed": seed,
                 "input_source": input_source,
+                "boss_attack": boss_attack,
                 "started_at": started.isoformat(timespec="microseconds"),
             })
         except BaseException:

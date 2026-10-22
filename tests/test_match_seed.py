@@ -86,5 +86,6 @@ def test_cli_uses_random_seed_by_default_and_preserves_explicit_seed(
     constructor.return_value.run.return_value = 0
     monkeypatch.setattr(app_module, "GameApp", constructor)
     assert app_module.main(arguments) == 0
-    constructor.assert_called_once_with("adaptive", expected_seed, False, False, True)
+    constructor.assert_called_once_with("adaptive", expected_seed, False, False, True,
+                                        boss_attack=None)
     constructor.return_value.run.assert_called_once_with(False, None)

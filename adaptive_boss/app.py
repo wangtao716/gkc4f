@@ -19,7 +19,7 @@ import pygame
 from . import __version__
 from .audio import SoundBank
 from .engine import (
-    CHARGE_DURATION, DASH_COOLDOWN, FOLLOWUP_ACTIVE_DURATION,
+    ATTACK_KINDS, CHARGE_DURATION, DASH_COOLDOWN, FOLLOWUP_ACTIVE_DURATION,
     FOLLOWUP_WARNING_DURATION, InputState, World,
 )
 from .input import KeyboardInput
@@ -98,7 +98,8 @@ class Spark:
 
 class GameApp:
     def __init__(self, mode: str = "adaptive", seed: int | None = None, mute: bool = False,
-                 headless: bool = False, record: bool = True) -> None:
+                 headless: bool = False, record: bool = True,
+                 boss_attack: str | None = None) -> None:
         if headless:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
             os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -117,7 +118,8 @@ class GameApp:
         self.clock = pygame.time.Clock()
         self.sound = SoundBank(enabled=not mute)
         self.keyboard = KeyboardInput()
-        self.world = World(mode=mode, seed=seed, width=ARENA.width, height=ARENA.height)
+        self.world = World(mode=mode, seed=seed, width=ARENA.width, height=ARENA.height,
+                           boss_attack=boss_attack)
         self.mode, self.seed, self.headless = mode, seed, headless
         self.scene = "menu"
         self.running = True
@@ -186,7 +188,8 @@ class GameApp:
         if self.record:
             try:
                 self.recorder = SessionRecorder(ROOT / "runs", self.mode, self.world.seed,
-                                                input_source=self.input_source)
+                                                input_source=self.input_source,
+                                                boss_attack=self.world.boss_attack)
                 self.log_path = self.recorder.path
             except OSError:
                 self.recorder = None
@@ -765,6 +768,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mode",choices=("adaptive","fixed"),default="adaptive")
     parser.add_argument("--seed",type=int,default=None,
                         help="固定随机种子以便复现；默认每局生成新种子")
+    parser.add_argument("--boss-attack",choices=ATTACK_KINDS,default=None,
+                        help="Boss 只使用指定招式：bomb 定点轰击，sweep 习惯横扫；默认随机选择")
     parser.add_argument("--mute",action="store_true",help="关闭音效")
     parser.add_argument("--headless",action="store_true",help="使用虚拟显示，配合 --smoke-test 验证")
     parser.add_argument("--smoke-test",action="store_true",help="自动演练并退出")
@@ -773,7 +778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args=parser.parse_args(argv)
     if args.headless and not args.smoke_test:
         parser.error("--headless 必须配合 --smoke-test，避免启动不可操作的游戏")
-    app=GameApp(args.mode,args.seed,args.mute,args.headless,not args.no_logs)
+    app=GameApp(args.mode,args.seed,args.mute,args.headless,not args.no_logs,
+                boss_attack=args.boss_attack)
     return app.run(args.smoke_test,args.screenshot)
 
 
