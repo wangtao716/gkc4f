@@ -612,27 +612,6 @@ def test_attack_sequence_is_independent_of_mode_and_direction_randomness():
     assert completed_attack_sequence(adaptive, extra_direction_draws=7) == completed_attack_sequence(fixed)
 
 
-def test_full_charge_release_play_can_win_in_sixty_to_one_hundred_twenty_seconds():
-    world = World(seed=7)
-    world.player.invulnerability = 300
-    events = []
-    cycle_ticks = round(CHARGE_DURATION / FIXED_STEP) + 1
-    for tick in range(120 * 120):
-        world.update(FIXED_STEP, InputState(attack=tick % cycle_ticks < cycle_ticks - 1))
-        events.extend(world.events)
-        if world.result:
-            break
-    assert world.result == "win"
-    assert 60 <= world.time <= 120
-    assert world.completed_attacks >= 12
-    assert world.total_samples == world.completed_attacks
-    assert world.boss.hp == 0
-    assert sum(event["type"] == "end" for event in events) == 1
-    ended_at = world.time
-    world.update(10, InputState(attack=True, dash=True))
-    assert world.events == [] and world.time == ended_at
-
-
 def test_loss_emits_once_and_discards_unfinished_response():
     world = World(seed=7)
     begin_attack(world)

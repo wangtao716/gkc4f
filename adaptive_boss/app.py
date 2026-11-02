@@ -606,7 +606,7 @@ class GameApp:
                     pygame.draw.rect(self.canvas,color,(1013,y+7,width,6))
                 self.text(f"{probability*100:.0f}%",1228,y,13,color,mono=True,anchor="topright")
             if world.attack_kind == "sweep":
-                self.text("未选边：未形成明显切向选择",940,470,13,MUTED)
+                self.text("未选边：整轮无明显切向偏向",940,470,13,MUTED)
         pygame.draw.line(self.canvas,LINE,(940,526),(1228,526))
         self.text("横扫实际命中",940,546,14,MUTED)
         self.text(f"{world.sweep_hits} / {world.sweep_attempts}",1228,542,19,AMBER,mono=True,anchor="topright")

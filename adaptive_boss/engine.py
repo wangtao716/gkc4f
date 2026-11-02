@@ -284,9 +284,6 @@ class World:
         self._response_radial = self._response_tangent = self._response_distance = 0.0
         self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
         self._last_movement_direction: str | None = None
-        self._first_escape: str | None = None
-        self._first_escape_time: float | None = None
-        self._escape_tangent = 0.0
         self._attacks_started = 0
         self._has_counter = self._counter_activated = False
         self._sweep_sign = 1.0
@@ -568,8 +565,6 @@ class World:
         self._response_radial = self._response_tangent = self._response_distance = 0.0
         self._response_travel = dict.fromkeys(DIRECTIONS[:-1], 0.0)
         self._last_movement_direction = None
-        self._first_escape = self._first_escape_time = None
-        self._escape_tangent = 0.0
         self._decision_time = self.time
         self._committed_move_speed = self._observed_move_speed
         self._sweep_sign = -1.0 if direction == "ccw" else 1.0
@@ -584,7 +579,7 @@ class World:
             attack_number=self._attacks_started, attack_id=self._attacks_started,
             has_counter=self._has_counter, tactic_label=self.tactic_label,
             attack_kind=self.attack_kind, decision_stage="lock",
-            response_rule="first_escape" if self.attack_kind == "sweep" else "whole_window",
+            response_rule="whole_window_tangent" if self.attack_kind == "sweep" else "whole_window",
             total_samples=self.total_samples,
             movement_speed_estimate=round(self._committed_move_speed, 3),
             movement_speed_source="previous_completed_bomb_response" if self.predictors["bomb"].samples else "initial_default",
@@ -683,14 +678,6 @@ class World:
             rx, ry, radial_distance = 0.0, 1.0, 1.0
         rx, ry = rx / radial_distance, ry / radial_distance
         radial, tangent = dx * rx + dy * ry, -dx * ry + dy * rx
-        # Capture the first real lateral escape, never the later rescue dash.
-        # Stop at beam ignition: moves in reaction to a visible sweep do not
-        # count as a pre-reveal habit, even if there was no earlier choice.
-        if self.attack_kind == "sweep" and self.phase == "lock" and self._first_escape is None:
-            self._escape_tangent += tangent
-            if abs(self._escape_tangent) >= SWEEP_RESPONSE_DISTANCE:
-                self._first_escape = "cw" if self._escape_tangent > 0 else "ccw"
-                self._first_escape_time = self.time
         self._response_radial += radial
         self._response_tangent += tangent
         self._response_distance += distance
@@ -706,7 +693,14 @@ class World:
             return
         radial, tangent = self._response_radial, self._response_tangent
         if self.attack_kind == "sweep":
-            actual = self._first_escape or "stay"
+            # Measure the complete response, including later reversals and
+            # rescue dashes. Opposite tangential movement cancels out.
+            if tangent >= SWEEP_RESPONSE_DISTANCE:
+                actual = "cw"
+            elif tangent <= -SWEEP_RESPONSE_DISTANCE:
+                actual = "ccw"
+            else:
+                actual = "stay"
         elif self._response_distance < 18.0:
             actual = "stay"
         else:
@@ -719,8 +713,8 @@ class World:
         self.predictor.observe(snapshot, actual)
         self._event("observation", mode=self.mode, context=list(self._pending_context or ()),
             attack_kind=self.attack_kind,
-            response_rule="first_escape" if self.attack_kind == "sweep" else "whole_window",
-            first_escape_time=round(self._first_escape_time, 6) if self._first_escape_time is not None else None,
+            response_rule="whole_window_tangent" if self.attack_kind == "sweep" else "whole_window",
+            first_escape_time=None,  # Retained for readers of older logs.
             total_samples=self.total_samples,
             features=list(snapshot.features), prediction=snapshot.label,
             probabilities=dict(zip(self.predictor.labels, snapshot.probabilities)),

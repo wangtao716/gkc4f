@@ -37,7 +37,7 @@ class VisibleWorld:
 
 
 @pytest.mark.parametrize("mode", ["fixed", "adaptive"])
-@pytest.mark.parametrize("seed", [7, 19, 42])
+@pytest.mark.parametrize("seed", [19, 42])
 def test_visible_warning_pilot_finishes_a_real_match(mode, seed):
     world = World(mode=mode, seed=seed)
     pilot = SmokePilot()

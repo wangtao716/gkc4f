@@ -9,7 +9,7 @@ import pytest
 
 from adaptive_boss.engine import (
     AIM_DURATION, BOSS_BODY_RADIUS, FIXED_STEP, InputState, LOCK_DURATION,
-    SWEEP_RESPONSE_DISTANCE, World,
+    SWEEP_DURATION, SWEEP_RESPONSE_DISTANCE, World,
 )
 from adaptive_boss.learning import EXPERT_NAMES
 from adaptive_boss.telemetry import SessionRecorder
@@ -75,7 +75,7 @@ def test_prediction_waits_for_lock_and_uses_position_at_that_instant():
     assert decision["decision_stage"] == "lock"
     assert decision["time"] == pytest.approx(world.time, abs=1e-6)
     assert snapshot.features[0] == pytest.approx(world.player.x / world.width)
-    assert world._first_escape is None and world._response_distance == 0
+    assert world._response_tangent == world._response_distance == 0
     assert world.predictor.samples == 8
 
 
@@ -133,7 +133,12 @@ def test_later_opposite_inputs_cannot_change_frozen_prediction_or_sweep():
     result = observation(events)
     assert result["features"] == list(snapshot.features)
     assert result["samples_before"] == 8 and result["samples_after"] == 9
-    assert result["decision_time"] < result["first_escape_time"] < result["time"]
+    assert result["decision_time"] < result["time"]
+    assert result["first_escape_time"] is None
+    assert result["response_rule"] == "whole_window_tangent"
+    alternate_result = observation(until_phase(alternate, "recovery"))
+    assert result["actual"] == "cw" and alternate_result["actual"] == "ccw"
+    assert alternate_result["features"] == list(snapshot.features)
 
 
 @pytest.mark.parametrize("kind", ["bomb", "sweep"])
@@ -169,6 +174,8 @@ def test_diagnostic_logs_preserve_lock_snapshot_after_learning(kind, tmp_path):
     assert current.expert_probabilities != snapshot.expert_probabilities
     for event in (decision, result):
         assert {field: event[field] for field in frozen} == frozen
+        assert event["response_rule"] == ("whole_window_tangent" if kind == "sweep" else "whole_window")
+    assert result["first_escape_time"] is None
 
     recorder = SessionRecorder(tmp_path, world.mode, 7)
     try:
@@ -181,35 +188,111 @@ def test_diagnostic_logs_preserve_lock_snapshot_after_learning(kind, tmp_path):
         recorder.close()
 
 
-def test_first_twenty_pixels_freeze_choice_before_a_longer_rescue_movement():
+@pytest.mark.parametrize("first_move,expected", [(-1, "ccw"), (1, "cw")])
+@pytest.mark.parametrize("reverse_during", ["lock", "active"])
+def test_longer_opposite_dash_overrides_initial_walk_at_sweep_end(first_move, expected, reverse_during):
     world = sweep_at_lock()
-    advance(world, 0.1, InputState(move_x=-1))
-    assert abs(world._escape_tangent) < SWEEP_RESPONSE_DISTANCE
-    assert world._first_escape is None
-    advance(world, 2 * FIXED_STEP, InputState(move_x=-1))
-    assert world._first_escape == "cw"
-    chosen_at = world._first_escape_time
-    assert world.predictor.samples == 8
-    until_phase(world, "active")
-    events = advance(world, 0.3, InputState(move_x=1, dash=True))
-    events.extend(until_phase(world, "recovery", InputState(move_x=1)))
+    advance(world, 0.12, InputState(move_x=first_move))
+    assert abs(world._response_tangent) > SWEEP_RESPONSE_DISTANCE
+    if reverse_during == "active":
+        until_phase(world, "active")
+    events = advance(world, 0.2, InputState(move_x=-first_move, dash=True))
+    assert world.predictor.samples == 8 and world.last_response is None
+    assert world.phase == reverse_during
+    events.extend(until_phase(world, "recovery"))
     result = observation(events)
-    assert result["directional_travel"]["ccw"] > result["directional_travel"]["cw"]
-    assert result["actual"] == "cw"
-    assert result["first_escape_time"] == pytest.approx(chosen_at, abs=1e-6)
-    assert result["response_rule"] == "first_escape"
-    assert world.predictor.history[-1] == "cw"
+    assert any(event["type"] == "dash" for event in events)
+    assert result["actual"] == expected
+    assert result["first_escape_time"] is None
+    assert result["response_rule"] == "whole_window_tangent"
+    assert world.predictor.history[-1] == expected
 
 
 @pytest.mark.parametrize("during_lock", [InputState(), InputState(move_y=1)])
-def test_stationary_or_radial_lock_then_visible_sweep_reaction_remains_stay(during_lock):
+def test_stationary_or_radial_lock_then_visible_sweep_reaction_is_counted(during_lock):
     world = sweep_at_lock()
     until_phase(world, "active", during_lock)
-    assert world._first_escape is None
+    assert world._response_tangent == pytest.approx(0)
     events = until_phase(world, "recovery", InputState(move_x=1, dash=True))
     result = observation(events)
     assert result["distance_moved"] > SWEEP_RESPONSE_DISTANCE
-    assert result["actual"] == "stay" and result["first_escape_time"] is None
+    assert result["actual"] == "ccw" and result["first_escape_time"] is None
+
+
+@pytest.mark.parametrize("controls", [InputState(), InputState(move_y=1)])
+def test_sweep_without_tangential_movement_remains_stay(controls):
+    world = sweep_at_lock()
+    result = observation(until_phase(world, "recovery", controls))
+    assert result["tangent_displacement"] == pytest.approx(0)
+    assert result["actual"] == "stay"
+
+
+def test_sweep_round_trip_cancels_even_with_substantial_directional_travel():
+    world = sweep_at_lock()
+    start = (world.player.x, world.player.y)
+    advance(world, 0.2, InputState(move_x=-1))
+    until_phase(world, "active")
+    advance(world, 0.2, InputState(move_x=1))
+    assert (world.player.x, world.player.y) == pytest.approx(start)
+    result = observation(until_phase(world, "recovery"))
+    assert result["directional_travel"]["cw"] > SWEEP_RESPONSE_DISTANCE
+    assert result["directional_travel"]["ccw"] > SWEEP_RESPONSE_DISTANCE
+    assert result["tangent_displacement"] == pytest.approx(0)
+    assert result["actual"] == "stay"
+
+
+@pytest.mark.parametrize("distance,expected", [
+    (19.999, "stay"), (20.0, "cw"), (20.001, "cw"),
+    (-19.999, "stay"), (-20.0, "ccw"), (-20.001, "ccw"),
+])
+def test_sweep_twenty_pixel_threshold_is_inclusive(distance, expected):
+    world = World(seed=7, boss_attack="sweep")
+    world.player.x = world.boss.x + 230
+    world.player.y = world.boss.y - distance / 2
+    until_phase(world, "lock")
+    # A segment symmetric about the horizontal radius has exactly this
+    # tangential displacement, avoiding rounding in a many-frame walk.
+    previous = (world.player.x, world.player.y)
+    world.player.y += distance
+    world._record_displacement(previous)
+    result = observation(until_phase(world, "recovery"))
+    assert result["tangent_displacement"] == pytest.approx(distance)
+    assert result["actual"] == expected
+
+
+def test_sweep_counts_last_active_frame_and_excludes_recovery_movement():
+    world = sweep_at_lock()
+    until_phase(world, "active")
+    advance(world, SWEEP_DURATION - 13 * FIXED_STEP)
+    events = advance(world, 12 * FIXED_STEP, InputState(move_x=-1))
+    assert abs(world._response_tangent) < SWEEP_RESPONSE_DISTANCE
+    assert world.phase == "active" and world.predictor.samples == 8
+    world.update(FIXED_STEP, InputState(move_x=-1))
+    events.extend(world.events)
+    result = observation(events)
+    assert world.phase == "recovery" and result["actual"] == "cw"
+    assert result["tangent_displacement"] >= SWEEP_RESPONSE_DISTANCE
+    completed_distance = world._response_distance
+    recovery_events = advance(world, 0.3, InputState(move_x=1, dash=True))
+    assert not any(event["type"] == "observation" for event in recovery_events)
+    assert world._response_distance == completed_distance
+    assert world.last_response == "cw" and world.predictor.samples == 9
+
+
+@pytest.mark.parametrize("finish_during", ["lock", "active"])
+def test_unfinished_sweep_response_does_not_train(finish_during):
+    world = sweep_at_lock()
+    advance(world, 0.12, InputState(move_x=-1))
+    if finish_during == "active":
+        until_phase(world, "active")
+    assert abs(world._response_tangent) > SWEEP_RESPONSE_DISTANCE
+    world.boss.hp = 0
+    world.update(FIXED_STEP, InputState())
+    assert world.result == "win"
+    assert world.predictor.samples == 8 and world.last_response is None
+    assert not any(event["type"] == "observation" for event in world.events)
+    world.update(2.0, InputState(move_x=1))
+    assert world.predictor.samples == 8
 
 
 def test_bomb_still_measures_the_whole_response_including_later_movement():
@@ -275,7 +358,7 @@ def test_predicted_side_is_hit_opposite_side_escapes_and_visible_reversal_rescue
     assert opposite.sweep_hits == rescue.sweep_hits == 0
     assert observation(same_events)["actual"] == label
     assert observation(other_events)["actual"] != label
-    assert observation(rescue_events)["actual"] == label
+    assert observation(rescue_events)["actual"] == ("ccw" if label == "cw" else "cw")
     assert any(event["type"] == "dash" for event in rescue_events)
 
 
@@ -285,7 +368,7 @@ def test_charging_still_allows_a_two_tenths_second_visible_rescue(label, sign, r
     world = sweep_at_lock(label, radius)
     events = play_script(world, sign, "rescue", 0.20, charging=True)
     assert world.player.hp == world.player.max_hp
-    assert observation(events)["actual"] == label
+    assert observation(events)["actual"] == ("ccw" if label == "cw" else "cw")
     assert any(event["type"] == "dash" for event in events)
 
 

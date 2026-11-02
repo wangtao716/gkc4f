@@ -59,8 +59,10 @@ class BehaviorPredictor:
 
     The engine owns independent instances for bombs and sweeps. Bombs learn
     clockwise/counterclockwise, toward/away, or stationary full responses.
-    Sweeps learn the first pre-ignition lateral escape (cw/ccw), with stay
-    meaning no clear choice. Both use real movement, never input buttons.
+    Sweeps learn net tangential movement from lock through beam completion
+    (cw/ccw), including later reversals and rescue dashes. The stay label means
+    no clear net side, including radial movement or cancelling lateral travel.
+    Both use real movement, never input buttons.
 
     Orders one through three interpolate transition counts with the shorter
     context's distribution; unseen histories fall back to recent frequency.
@@ -73,7 +75,7 @@ class BehaviorPredictor:
 
     ``correct`` and ``baseline_correct`` cover every response, including
     ``stay``.  ``direction_samples`` and ``direction_correct`` exclude
-    stationary responses.  ``recent_accuracy`` covers the latest 20 responses.
+    stay responses.  ``recent_accuracy`` covers the latest 20 responses.
     These are predictions made *before* their corresponding training update.
     """
 
